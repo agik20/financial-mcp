@@ -16,6 +16,8 @@ wheels/
 # Environment
 .env
 
+# Backup
+backup/
+
 # Data pribadi - JANGAN DI-PUSH
-Personal Finance - Transactions.csv
-Personal Finance - Transactions.json
+data/
