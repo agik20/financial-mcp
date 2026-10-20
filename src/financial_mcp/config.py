@@ -17,9 +17,11 @@ ES_API_KEY: Optional[str] = os.getenv("ES_API_KEY")
 #       ("Finance  -") -- do NOT "fix" this.
 _PACKAGE_DIR: str = os.path.dirname(__file__)
 
+_DATA_DIR: str = os.path.normpath(os.path.join(_PACKAGE_DIR, "..", "..", "data"))
+
 DATA_FILE_PATH: str = os.path.join(
-    _PACKAGE_DIR, "..", "data", "Personal Finance  - Transactions.json",
+    _DATA_DIR, "Personal Finance  - Transactions.json",
 )
 DATA_CSV_PATH: str = os.path.join(
-    _PACKAGE_DIR, "..", "data", "Personal Finance  - Transactions.csv",
+    _DATA_DIR, "Personal Finance  - Transactions.csv",
 )
