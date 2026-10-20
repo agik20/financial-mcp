@@ -8,3 +8,14 @@ wheels/
 
 # Virtual environments
 .venv
+
+# IDE
+.vscode/
+.idea/
+
+# Environment
+.env
+
+# Data pribadi - JANGAN DI-PUSH
+Personal Finance - Transactions.csv
+Personal Finance - Transactions.json
