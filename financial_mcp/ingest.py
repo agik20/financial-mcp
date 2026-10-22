@@ -21,10 +21,10 @@ INDEX_MAPPING: dict = {
         "properties": {
             "type": {"type": "keyword"},
             "category": {"type": "keyword"},
+            "parent-category": {"type": "keyword"},
             "sourceName": {"type": "keyword"},
             "unit": {"type": "keyword"},
             "value": {"type": "long"},
-            "balance": {"type": "long"},
             "description": {"type": "text"},
             "creationDate": {"type": "date"},
             "day": {"type": "date"},

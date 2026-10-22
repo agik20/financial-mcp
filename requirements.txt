@@ -1,0 +1,7 @@
+# Core MCP server
+elasticsearch>=8.0.0,<9.0.0
+mcp[cli]>=1.26.0
+pydantic>=2.12.5
+
+# Data conversion (CLI helper)
+pandas>=2.0.0
