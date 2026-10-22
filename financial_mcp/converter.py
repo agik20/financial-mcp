@@ -74,10 +74,10 @@ def transform_row(row: pd.Series) -> Dict[str, Any]:
     return {
         "type": row.get("Type"),
         "category": row.get("Category"),
+        "parent-category": row.get("Parent"),
         "sourceName": row.get("Account"),
         "unit": "IDR",
-        "value": clean_currency(row.get("Amount")),
-        "balance": clean_currency(row.get("Balance")),
+        "value": clean_currency(row.get("Signed Amount")),
         "description": row.get("Detail Transaction"),
         # Time fields
         "creationDate": (
