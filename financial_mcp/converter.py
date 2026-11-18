@@ -58,46 +58,38 @@ def parse_date(date_val: Any) -> Optional[pd.Timestamp]:
     return pd.to_datetime(date_val)
 
 
+
 def transform_row(row: pd.Series) -> Dict[str, Any]:
-    """Transform a single CSV row into the Elasticsearch document schema.
+    """Transform a CSV row into the canonical transaction schema."""
 
-    Args:
-        row: A pandas Series representing one row of the input file.
-
-    Returns:
-        A dictionary with keys ``type``, ``category``, ``sourceName``,
-        ``unit``, ``value``, ``balance``, ``description``, and the
-        time-related fields.
-    """
-    date = parse_date(row["Date"])
+    transaction_date = parse_date(row["Date"])
+    pay_cycle = parse_date(row["Pay Cycle"])
 
     return {
-        "type": row.get("Type"),
-        "category": row.get("Category"),
-        "parent-category": row.get("Parent"),
-        "sourceName": row.get("Account"),
-        "unit": "IDR",
-        "value": clean_currency(row.get("Signed Amount")),
-        "description": row.get("Detail Transaction"),
-        # Time fields
-        "creationDate": (
-            date.isoformat() if date is not None else None
+        "transaction_id": str(row["ID"]).strip(),
+        "transaction_date": (
+            transaction_date.strftime("%Y-%m-%d")
+            if transaction_date is not None else None
         ),
-        "day": (
-            date.strftime("%Y-%m-%d") if date is not None else None
+        "category": row["Category"],
+        "type": row["Type"],
+        "parent_category": row["Parent"],
+        "source_account": row["Account"],
+        "destination_account": (
+            None
+            if pd.isna(row["Destination Account"])
+            or not str(row["Destination Account"]).strip()
+            else str(row["Destination Account"]).strip()
         ),
-        "dayOfWeek": (
-            date.strftime("%A") if date is not None else None
-        ),
-        "hour": date.hour if date is not None else 0,
-        # Custom
-        "payCycle": (
-            pd.to_datetime(row.get("Pay Cycle")).strftime("%Y-%m-%d")
-            if not pd.isna(row.get("Pay Cycle"))
-            else None
+        "amount": clean_currency(row["Amount"]),
+        "signed_amount": clean_currency(row["Signed Amount"]),
+        "currency": "IDR",
+        "description": row["Detail Transaction"],
+        "pay_cycle": (
+            pay_cycle.strftime("%Y-%m-%d")
+            if pay_cycle is not None else None
         ),
     }
-
 
 # ---------------------------------------------------------------------------
 # Main conversion
@@ -140,3 +132,4 @@ def convert_csv_to_json() -> None:
 
 if __name__ == "__main__":
     convert_csv_to_json()
+

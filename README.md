@@ -14,7 +14,6 @@ Personal financial transaction exports are often easy to store but cumbersome to
 - Which categories account for most of my spending?
 - Compare income and expenses between two months.
 - Show my recent transactions.
-- When was my latest balance recorded?
 
 The project currently uses a single sample financial transaction dataset and a local Elasticsearch instance.
 
@@ -22,22 +21,56 @@ The project currently uses a single sample financial transaction dataset and a l
 
 - Convert bank/fintech CSV transaction exports to normalized JSON
 - Normalize Indonesian Rupiah currency values
-- Derive date-related fields such as day, day of week, and hour
-- Store transactions in Elasticsearch
-- Generate deterministic document IDs using MD5 hashes to prevent duplicate documents
+- Validate every record against a strict 12-field schema before indexing
+- Safe staging-index ingestion: a new versioned physical index is created, fully loaded, and verified before the live alias is switched atomically — the currently-active index is never deleted during ingestion
 - Query transactions by:
   - Date range
   - Transaction type
   - Category
-  - Source
+  - Source account
 - Perform daily, weekly, and monthly time-series aggregations
 - Calculate spending by category
 - Generate financial summaries
 - Expose financial operations through MCP tools
 - Provide MCP prompts for common financial analysis workflows
 - Run entirely against a local Elasticsearch instance
+- 98 automated tests with full coverage of ingestion, query, and validation logic
 
 ## Architecture
+
+### Ingestion: Safe Staging Workflow
+
+`ingest.py` uses a versioned physical index + alias architecture so that the
+currently live data is never destroyed by an ingestion failure:
+
+```text
+  financial-transactions-active   ←  stable alias (what queries use)
+  │
+  ├── financial-transactions-20260101-120000-00   ← physical index v1
+  ├── financial-transactions-20260102-093000-00   ← physical index v2  (live)
+  └── (future runs create v3, v4, …)
+```
+
+Each ingestion run:
+
+1. **Preflight** — validates the entire JSON dataset *before* touching Elasticsearch.
+2. **Create staging index** — a new versioned physical index is created with the
+   canonical 12-field mapping.
+3. **Bulk load** — all documents are bulk-indexed into the staging index.
+4. **Verify staging** — count, spot-fetch, and index health are checked on the
+   new index before the switch.
+5. **Atomic alias switch** — the `financial-transactions-active` alias is moved
+   from the old physical index to the new one in a single `update_aliases` call.
+6. **Final verify** — the alias target and document count are confirmed.
+
+If any step before the alias switch fails, the staging index is cleaned up and
+the alias is untouched. The previous physical index is always kept — the
+operator can manually roll back at any time.
+
+### Query path
+
+All MCP tools query the `financial-transactions-active` alias, never a
+physical index name.
 
 ```text
                     Bank / Fintech CSV
@@ -46,13 +79,16 @@ The project currently uses a single sample financial transaction dataset and a l
               financial_mcp/converter.py
                            │
                            ▼
-             Normalized Transaction JSON
+           Normalized Transaction JSON
+           (12-field canonical schema)
                            │
                            ▼
-                financial_mcp/ingest.py
+               financial_mcp/ingest.py
+               (staging index + alias switch)
                            │
                            ▼
-             Elasticsearch: financial-transactions
+  Elasticsearch: financial-transactions-active
+  (alias → versioned physical index)
                            │
                            ▼
               financial_mcp/server.py
@@ -63,7 +99,7 @@ The project currently uses a single sample financial transaction dataset and a l
                            │
                            ▼
                   Natural Language
-                     Interaction
+                    Interaction
 ```
 
 The important distinction is that the natural-language reasoning happens on the **client side**.
@@ -111,7 +147,7 @@ Natural-language response
 | MCP Transport | stdio |
 | LLM | None on server; handled by MCP client |
 | Containerization | Not currently implemented |
-| Testing | Not currently implemented |
+| Testing | pytest + 98 tests (mocked ES client, no live cluster required) |
 | CI/CD | Not currently implemented |
 
 ## Project Structure
@@ -120,33 +156,35 @@ Natural-language response
 financial-mcp/
 ├── financial_mcp/
 │   ├── __init__.py
-│   ├── config.py
-│   ├── es_client.py
-│   ├── models.py
-│   ├── server.py
-│   ├── ingest.py
-│   ├── converter.py
+│   ├── config.py          # alias names, index prefix, data paths
+│   ├── es_client.py       # client, validation, INDEX_MAPPING (12-field canonical schema)
+│   ├── models.py          # Pydantic models (QueryTransactionParams)
+│   ├── server.py          # FastMCP entry point + prompts
+│   ├── ingest.py          # staging-index workflow (never deletes live index)
+│   ├── converter.py       # CSV → normalized JSON
 │   └── tools/
 │       ├── __init__.py
 │       ├── transactions.py
 │       └── analytics.py
 │
+├── tests/                 # 98 pytest tests (mocked, no live ES needed)
+├── docs/
+│   └── USER_MANUAL.md
 ├── data/
 ├── backup/
 ├── pyproject.toml
-├── README.md
-└── USER_MANUAL.md
+└── README.md
 ```
 
 ### Core modules
 
 | Module | Responsibility |
 |---|---|
-| `config.py` | Application and Elasticsearch configuration |
-| `es_client.py` | Elasticsearch client utilities and query execution |
-| `models.py` | Data models and validation |
+| `config.py` | Alias name, physical index prefix, data file paths |
+| `es_client.py` | ES client, transaction validation, `INDEX_MAPPING` (12-field canonical schema) |
+| `models.py` | Pydantic models (`QueryTransactionParams`) |
 | `converter.py` | CSV → normalized JSON conversion |
-| `ingest.py` | Elasticsearch index creation/deletion and bulk ingestion |
+| `ingest.py` | Staging-index workflow: create → load → verify → atomic alias switch |
 | `server.py` | FastMCP server and MCP registration |
 | `tools/transactions.py` | Transaction retrieval and filtering tools |
 | `tools/analytics.py` | Financial analytics tools |
@@ -217,28 +255,15 @@ No `.env` file is required by the current implementation.
 
 `converter.py` converts the source CSV into the normalized JSON format used by Elasticsearch.
 
-Expected CSV columns:
+The converter reads the source CSV and produces canonical 12-field JSON
+documents. The converter performs:
 
-```text
-Date
-Type
-Category
-Account
-Amount
-Balance
-Detail Transaction
-Pay Cycle
-```
-
-The converter performs operations including:
-
-- Currency formatting cleanup
-- Date parsing
-- Transaction field normalization
-- Derivation of:
-  - `day`
-  - `dayOfWeek`
-  - `hour`
+- Currency parsing (Indonesian Rupiah format normalization)
+- Date parsing (source `MM/DD/YYYY` → ISO `YYYY-MM-DD`)
+- Field validation against the canonical schema
+- Sign conventions enforcement (`signed_amount`)
+- Transfer invariant checks (destination required, source ≠ destination,
+  amount > 0, signed_amount < 0)
 
 For example:
 
@@ -256,20 +281,35 @@ The resulting JSON is stored under the `data/` directory.
 
 ## Data Ingestion
 
-`ingest.py` manages the Elasticsearch index:
+`ingest.py` implements a safe staging workflow that never deletes or overwrites
+the currently active index:
 
-```text
-financial-transactions
+1. **Preflight** — validates the entire JSON dataset (schema, duplicates, types)
+   before touching Elasticsearch.
+2. **Create staging index** — a new versioned physical index is created under
+   the prefix `financial-transactions-YYYYMMDD-HHMMSS[-seq]`.
+3. **Bulk load** — all documents are bulk-indexed; partial success is never
+   treated as complete.
+4. **Verify staging** — count, spot-fetch, and index health are checked.
+5. **Atomic alias switch** — the `financial-transactions-active` alias is moved
+   from the previous target to the new index in a single `update_aliases` call.
+6. **Final verify** — the alias target and document count are confirmed.
+
+If any step before the alias switch fails, the staging index is deleted and the
+alias is left untouched. The previous physical index is always preserved so the
+operator can manually roll back.
+
+Run with:
+
+```bash
+python -m financial_mcp.ingest
 ```
 
-The ingestion process:
+Output on success:
 
-1. Creates or recreates the Elasticsearch index.
-2. Reads the processed transaction JSON.
-3. Generates deterministic document IDs using MD5 hashes.
-4. Bulk-inserts the transaction documents into Elasticsearch.
-
-The deterministic document ID prevents the same transaction from being inserted repeatedly when the same source data is ingested again.
+```text
+OK  alias=financial-transactions-active staging=financial-transactions-20260101-120000-00 previous=None docs=106
+```
 
 ## MCP Server
 
@@ -354,11 +394,18 @@ Calculates spending grouped by category, including:
 
 Returns a high-level financial summary including:
 
-- Total income
-- Total expenses
-- Net amount
-- Latest balance
-- Top 10 spending categories
+- `total_income` — sum of `signed_amount` for Income documents
+- `total_expense` — sum of `amount` for Expense documents
+- `net_cash_flow` — `total_income - total_expense` (Transfers are excluded
+  entirely; they represent money moving between the owner's own accounts
+  and must not be counted as gains or losses)
+- `top_categories` — the 10 highest-magnitude categories by `amount`
+  (Income + Expense only; Transfers excluded)
+- `total_documents` — total transaction count (includes Transfers, which
+  remain stored and queryable)
+
+The tool deliberately does **not** report a balance figure: the canonical data
+model has no balance column.
 
 ## MCP Prompts
 
@@ -391,7 +438,6 @@ Once connected to Claude Desktop, examples of natural-language requests include:
 ```
 
 ```text
-"Saldo terakhir saya kapan dan berapa?"
 ```
 
 Claude translates these requests into appropriate MCP tool calls.
@@ -432,9 +478,7 @@ A financial summary returned by the server can contain data such as:
 {
   "total_income": 1250000,
   "total_expense": 8400000,
-  "net": 4100000,
-  "latest_balance": 32977,
-  "latest_balance_date": "2026-02-24",
+  "net_cash_flow": -7150000,
   "top_categories": [
     {
       "category": "Loan",
@@ -453,24 +497,30 @@ Values shown above represent an example response structure, not live financial d
 
 ## Data Model
 
-The normalized transaction data contains fields including:
+The canonical transaction schema (12 fields, `dynamic: strict` — any extra
+key is rejected at index time) is:
 
-```text
-type
-category
-sourceName
-unit
-value
-balance
-description
-creationDate
-day
-dayOfWeek
-hour
-payCycle
-```
+| Field | Type | Notes |
+|---|---|---|
+| `transaction_id` | `keyword` | Document `_id` — must match exactly, no hashing |
+| `transaction_date` | `date` | `YYYY-MM-DD` (required) |
+| `category` | `keyword` | Must be a known category (validated against `CATEGORY_MAPPING`) |
+| `type` | `keyword` | `Expense`, `Income`, or `Transfer` |
+| `parent_category` | `keyword` | `Living`, `Lifestyle`, or `Financial` |
+| `source_account` | `keyword` | e.g. `"BNI"` |
+| `destination_account` | `keyword` | `null` for non-transfers; must differ from `source_account` when `type=Transfer` |
+| `amount` | `long` | Positive integer magnitude (IDR) |
+| `signed_amount` | `long` | Positive for `Income`, negative for `Expense`/`Transfer` |
+| `currency` | `keyword` | `"IDR"` |
+| `description` | `text` | Free-form transaction detail |
+| `pay_cycle` | `date` / `null` | `YYYY-MM-DD` for salary/income cycles, `null` otherwise |
 
-Transactions currently use IDR as the currency unit.
+`signed_amount` is used for Income totals; `amount` is used for Expense
+magnitudes and Transfer magnitudes. `net_cash_flow` is computed as
+`total_income − total_expense` with Transfer transactions excluded entirely
+(Transfers represent money moving between the owner's own accounts and do
+not count as gains or losses). There is no balance field in the schema —
+the source CSV does not carry balance snapshots.
 
 ## Elasticsearch Analytics
 
@@ -538,40 +588,37 @@ The repository's Git history has been cleaned after sensitive development data w
 
 This project is currently in **development**.
 
-Current limitations:
+Current state:
 
+- 98 automated tests (pytest, mocked ES — no live cluster required)
+- mypy-clean type checking
+- Staging-index ingestion with atomic alias switch
+- Canonical 12-field schema with strict validation
 - No release tags
-- No automated tests
-- No test suite
 - No linting configuration
-- No static type-checking configuration
 - No pre-commit hooks
 - No GitHub Actions CI/CD
 - No Docker configuration
 - Single-source transaction dataset
 - No documented public roadmap yet
 
-These limitations are intentional indicators of the project's current development stage rather than supported production guarantees.
-
 ## Current Capabilities
 
 The current implementation supports:
 
 - CSV → JSON conversion
-- Transaction normalization
-- Elasticsearch index management
-- Bulk transaction ingestion
+- Canonical 12-field schema validation
+- Safe staging-index ingestion (alias switch, no live-index destruction)
 - Four MCP tools
 - Three MCP prompts
-- Date-range filtering
+- Date-range filtering (`transaction_date`)
 - Transaction type filtering
 - Category filtering
-- Source filtering
-- Daily time-series aggregation
-- Weekly time-series aggregation
-- Monthly time-series aggregation
+- Source-account filtering
+- Daily / weekly / monthly time-series aggregation
 - Category-level spending analysis
 - Financial summary generation
+- 98 automated tests (pytest)
 
 ## Roadmap
 

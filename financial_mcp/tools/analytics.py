@@ -1,4 +1,19 @@
-"""MCP tools for financial analytics (category breakdown, summary)."""
+"""MCP tools for financial analytics (category breakdown, summary).
+
+All monetary calculations use the canonical transaction schema:
+
+* **Expense** magnitudes come from :data:`amount` (non-negative integer)
+  for expense documents.
+* **Income** totals use :data:`signed_amount` (positive or zero for income
+  documents).
+* **Transfer transactions are excluded entirely** from consolidated income,
+  expense, and net cash flow.  They represent money moving between the
+  owner's own accounts and must not be counted as gains or losses.
+* **Net cash flow** = total_income − total_expense (Transfers excluded).
+* No account balances are returned.  The canonical data model does not
+  carry balance snapshots, and inventing one would be a data-integrity
+  failure -- the source CSV has no balance column.
+"""
 
 import json
 from typing import Any, Dict
@@ -22,17 +37,24 @@ def register_analytics_tools(mcp: FastMCP) -> None:
     ) -> str:
         """Get total spending grouped by category.
 
+        The transaction type defaults to ``"Expense"`` when not supplied.
+        The result uses :data:`amount` for expense magnitudes and returns,
+        for each category: total spending, percentage of grand total,
+        transaction count, and average per-transaction amount.
+
         Args:
-            params: Filter parameters.  ``type`` defaults to ``"Expense"``
-                when not specified.
+            params: Filter parameters.  ``type`` defaults to
+                ``"Expense"`` when not specified; ``start_date`` /
+                ``end_date`` filter on ``transaction_date``.
 
         Returns:
             A JSON string with the grand total, per-category breakdown
             (total, percentage, transaction count, average), and the
-            category filter that was applied.
+            type filter that was applied.
         """
+        tx_type = params.type or "Expense"
         must_clauses: list[Dict[str, Any]] = [
-            {"term": {"type": params.type or "Expense"}}
+            {"term": {"type": tx_type}}
         ]
 
         if params.start_date or params.end_date:
@@ -41,8 +63,15 @@ def register_analytics_tools(mcp: FastMCP) -> None:
                 date_range["gte"] = params.start_date
             if params.end_date:
                 date_range["lte"] = params.end_date
-            must_clauses.append({"range": {"day": date_range}})
+            must_clauses.append(
+                {"range": {"transaction_date": date_range}}
+            )
 
+        # Sum ``amount`` (positive magnitude) for the requested type.  For
+        # expenses this is the spending total; for income it would be the
+        # total received.  The tool name says "spending" but the filter is
+        # the caller's responsibility -- the aggregation itself is always
+        # magnitude-based.
         es_query: Dict[str, Any] = {
             "size": 0,
             "query": {"bool": {"must": must_clauses}},
@@ -50,12 +79,12 @@ def register_analytics_tools(mcp: FastMCP) -> None:
                 "by_category": {
                     "terms": {"field": "category", "size": 20},
                     "aggs": {
-                        "total": {"sum": {"field": "value"}},
-                        "tx_count": {"value_count": {"field": "value"}},
-                        "avg_per_tx": {"avg": {"field": "value"}},
+                        "total": {"sum": {"field": "amount"}},
+                        "tx_count": {"value_count": {"field": "amount"}},
+                        "avg_per_tx": {"avg": {"field": "amount"}},
                     },
                 },
-                "grand_total": {"sum": {"field": "value"}},
+                "grand_total": {"sum": {"field": "amount"}},
             },
         }
 
@@ -89,7 +118,7 @@ def register_analytics_tools(mcp: FastMCP) -> None:
 
         return json.dumps(
             {
-                "type": params.type or "Expense",
+                "type": tx_type,
                 "grand_total": grand_total,
                 "categories": result,
             },
@@ -99,12 +128,30 @@ def register_analytics_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     async def get_financial_summary() -> str:
-        """Get overall financial summary: total income, expense, net balance,
-        and top categories.
+        """Get an overall financial summary across all transactions.
+
+        Consolidated cash-flow figures **exclude Transfer transactions
+        entirely**.  Transfers represent money moving between the owner's
+        own accounts and must not be counted as gains or losses.
+
+        The response contains:
+
+        * ``total_income``  -- sum of ``signed_amount`` for income
+          documents.
+        * ``total_expense`` -- sum of ``amount`` for expense documents.
+        * ``net_cash_flow`` -- ``total_income - total_expense``
+          (Transfers excluded).
+        * ``top_categories``-- the 10 highest-magnitude categories by
+          ``amount`` (Income + Expense only; Transfers excluded).
+        * ``total_documents``-- the total number of transaction documents
+          (including Transfers, which are still stored and queryable).
+
+        This tool deliberately does **not** report a ``latest_balance``:
+        the canonical schema has no balance column, and inventing one
+        would be a data-integrity failure.
 
         Returns:
-            A JSON string with totals, net, latest balance info, top
-            10 categories, and total document count.
+            A JSON string with the figures above.
         """
         es_query: Dict[str, Any] = {
             "size": 0,
@@ -112,22 +159,29 @@ def register_analytics_tools(mcp: FastMCP) -> None:
             "aggs": {
                 "total_income": {
                     "filter": {"term": {"type": "Income"}},
-                    "aggs": {"sum": {"sum": {"field": "value"}}},
+                    "aggs": {"sum": {"sum": {"field": "signed_amount"}}},
                 },
                 "total_expense": {
                     "filter": {"term": {"type": "Expense"}},
-                    "aggs": {"sum": {"sum": {"field": "value"}}},
+                    "aggs": {"sum": {"sum": {"field": "amount"}}},
                 },
+                # net_cash_flow is computed client-side as
+                # total_income - total_expense so Transfers are excluded
+                # by construction.
                 "by_category": {
-                    "terms": {"field": "category", "size": 10},
-                    "aggs": {"total": {"sum": {"field": "value"}}},
-                },
-                "latest_balance": {
-                    "top_hits": {
-                        "size": 1,
-                        "sort": [{"creationDate": {"order": "desc"}}],
-                        "_source": ["balance", "creationDate"],
-                    }
+                    "filter": {
+                        "bool": {
+                            "must_not": [{"term": {"type": "Transfer"}}]
+                        }
+                    },
+                    "aggs": {
+                        "terms": {
+                            "terms": {"field": "category", "size": 10},
+                            "aggs": {
+                                "total": {"sum": {"field": "amount"}}
+                            },
+                        }
+                    },
                 },
             },
         }
@@ -141,26 +195,19 @@ def register_analytics_tools(mcp: FastMCP) -> None:
         aggs = data["aggregations"]
         total_income = aggs["total_income"]["sum"]["value"]
         total_expense = aggs["total_expense"]["sum"]["value"]
-        latest = aggs["latest_balance"]["hits"]["hits"]
-        latest_balance = (
-            latest[0]["_source"]["balance"] if latest else None
-        )
-        latest_date = (
-            latest[0]["_source"]["creationDate"] if latest else None
-        )
+        net_cash_flow = total_income - total_expense
 
+        by_cat_terms = aggs["by_category"]["terms"]
         top_categories = [
             {"category": b["key"], "total": b["total"]["value"]}
-            for b in aggs["by_category"]["buckets"]
+            for b in by_cat_terms["buckets"]
         ]
 
         return json.dumps(
             {
                 "total_income": total_income,
                 "total_expense": total_expense,
-                "net": total_income - total_expense,
-                "latest_balance": latest_balance,
-                "latest_balance_date": latest_date,
+                "net_cash_flow": net_cash_flow,
                 "top_categories": top_categories,
                 "total_documents": data["hits"]["total"]["value"],
             },
