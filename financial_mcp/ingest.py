@@ -112,30 +112,36 @@ def _alias_transition_lock() -> Iterator[None]:
 
 
 def _is_definitive_es_rejection(exc: BaseException) -> bool:
-    """Return True when *exc* is a definitive Elasticsearch server rejection.
+    """Return True when *exc* is a definitively safe-to-classify rejection.
 
-    A definitive rejection means the server responded with an HTTP error
-    status (4xx/5xx).  In elasticsearch-py 8.x these are subclasses of
-    :class:`~elasticsearch.exceptions.ApiError` (HTTP response errors)
-    or the specific :class:`~elasticsearch.exceptions.RequestError`
-    (base of all non-2xx HTTP responses).
+    A definitive rejection means the server received the request and
+    explicitly refused it, with a response that proves the alias update
+    was **not** applied.  In elasticsearch-py 8.x these are specific
+    4xx :class:`~elasticsearch.exceptions.ApiError` subclasses:
 
-    Anything else — transport errors (timeouts, connection resets, SSL
-    errors), serialization errors, or non-ES exceptions — means the
-    request *may* have reached the server and been applied before the
-    client received the response.  Those are ambiguous and must be
-    treated as ``update_outcome_unknown``.
+    - 400 (BadRequestError)
+    - 403 (AuthorizationException)
+    - 404 (NotFoundError)
+
+    All other statuses are classified as **ambiguous** and the caller
+    must treat the outcome as ``update_outcome_unknown``:
+
+    - 408 (Request Timeout): the timeout may originate from a proxy or
+      gateway in front of Elasticsearch; the update may have been applied
+      before the timeout was returned.
+    - 429 (Too Many Requests): the server may have applied the update
+      before returning the rate-limit response.
+    - 5xx (500–599): the server-side failure may have occurred after
+      the alias update was applied.
+    - Unknown status or missing metadata: fail safe as ambiguous.
+    - Transport errors (timeout, connection reset, SSL error) and any
+      non-Elasticsearch exception: the request may have reached the
+      server and been applied before the client received the error.
     """
-    # es_exceptions.ApiError is the base of all HTTP response errors
-    # (BadRequestError, NotFoundError, AuthorizationException, etc.)
-    # es_exceptions.RequestError is also a subclass of ApiError.
-    if isinstance(exc, es_exceptions.ApiError):
-        return True
-    # Some versions also have RequestError as a direct subclass of ApiError;
-    # catch it explicitly for clarity even if redundant.
-    if isinstance(exc, es_exceptions.RequestError):
-        return True
-    return False
+    if not isinstance(exc, es_exceptions.ApiError):
+        return False
+    status = getattr(getattr(exc, "meta", None), "status", None)
+    return status in (400, 403, 404)
 
 
 def _is_resource_already_exists(exc: es_exceptions.BadRequestError) -> bool:
@@ -216,17 +222,19 @@ class SwitchOutcome:
       was never referenced by the alias.  The caller *may* clean up the
       staging index.
     - ``"update_failed"``: ``update_aliases`` raised a **definitive
-      Elasticsearch rejection** (an :class:`~elasticsearch.exceptions.ApiError`
-      subclass — the server responded with an HTTP error status).  The
-      update was **not** applied server-side.  The caller *may* clean up
-      the staging index.
-    - ``"update_outcome_unknown"``: ``update_aliases`` raised a
-      **transport-level or unclassifiable exception**
-      (:class:`~elasticsearch.exceptions.TransportError` subclass —
-      connection timeout, reset, SSL error — or any non-ES exception).
-      The server *may* have applied the update before the client received
-      the response.  The caller must **not** auto-delete the staging
-      index.  The operator must inspect the alias manually.
+      Elasticsearch rejection** — an HTTP 400, 403, or 404
+      :class:`~elasticsearch.exceptions.ApiError` subclass.  The
+      server explicitly refused the request; the update was **not**
+      applied server-side.  The caller *may* clean up the staging index.
+    - ``"update_outcome_unknown"``: ``update_aliases`` raised an
+      **ambiguous exception** — HTTP 408 (timeout), HTTP 429 (rate
+      limit), any 5xx :class:`~elasticsearch.exceptions.ApiError`
+      (the server may have applied the update before the error was
+      returned), a :class:`~elasticsearch.exceptions.TransportError`
+      subclass (connection timeout, reset, SSL error), or any non-ES
+      exception.  The server *may* have applied the update before the
+      client received the error.  The caller must **not** auto-delete
+      the staging index.  The operator must inspect the alias manually.
     """
     state: Literal[
         "confirmed",
@@ -614,8 +622,8 @@ def _atomic_alias_switch(
             client.indices.update_aliases(actions=actions)
         except Exception as exc:
             if _is_definitive_es_rejection(exc):
-                # The server responded with an HTTP error — the update was
-                # NOT applied.  Safe to treat as a clean failure.
+                # 400/403/404: the server explicitly rejected the request —
+                # the update was NOT applied.  Safe to treat as a clean failure.
                 logger.error(
                     "update_aliases definitively rejected: %s: %s",
                     type(exc).__name__, exc,
@@ -625,9 +633,10 @@ def _atomic_alias_switch(
                     previous_active=previous_active,
                     detail=f"definitive rejection: {exc}",
                 )
-            # Transport error, timeout, connection reset, or non-ES exception:
-            # the request MAY have been applied server-side.  We cannot
-            # confirm, so the staging index must NOT be auto-deleted.
+            # 408, 429, 5xx ApiError, transport error, connection reset, or
+            # non-ES exception: the request MAY have been applied
+            # server-side.  We cannot confirm, so the staging index must
+            # NOT be auto-deleted.
             logger.error(
                 "update_aliases outcome UNKNOWN: %s: %s -- the request may "
                 "have been applied before the client received the error. "
@@ -795,13 +804,15 @@ def run_ingest(
         #     Safe to delete the staging index we own.
         #   update_failed:
         #     update_aliases raised a DEFINITIVE Elasticsearch rejection
-        #     (HTTP 4xx/5xx from the server).  The update was NOT applied.
-        #     Safe to delete the staging index we own.
+        #     (HTTP 400, 403, or 404 from the server).  The update was
+        #     NOT applied.  Safe to delete the staging index we own.
         #   update_outcome_unknown:
-        #     update_aliases raised a TRANSPORT error (timeout, connection
-        #     reset, SSL error) or a non-ES exception.  The request MAY
-        #     have reached the server and been applied.  The alias may now
-        #     target the staging index.  We must NOT delete it.
+        #     update_aliases raised an AMBIGUOUS exception: HTTP 408
+        #     (timeout), HTTP 429 (rate limit), any 5xx ApiError, a
+        #     TRANSPORT error (connection reset, SSL error), or a
+        #     non-ES exception.  The request MAY have reached the
+        #     server and been applied.  The alias may now target the
+        #     staging index.  We must NOT delete it.
         #   postcondition_failed:
         #     update_aliases succeeded but the postcondition read showed a
         #     target other than staging (or the read itself raised).
