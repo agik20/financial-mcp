@@ -1318,22 +1318,84 @@ def _make_connection_error(msg: str = "connection reset"):
 
 
 class TestIsDefinitiveEsRejection:
-    """_is_definitive_es_rejection correctly classifies exception types."""
+    """_is_definitive_es_rejection correctly classifies exception types.
 
-    def test_bad_request_is_definitive(self):
+    4xx ApiError subclasses → definitive (update was NOT applied).
+    5xx ApiError subclasses → ambiguous (update MAY have been applied).
+    Transport errors → ambiguous.
+    Non-ES exceptions → ambiguous.
+    """
+
+    @staticmethod
+    def _make_5xx_error(status: int = 500, msg: str = "internal server error"):
+        from elasticsearch import exceptions as es_exceptions
+        from elastic_transport import ApiResponseMeta, HttpHeaders, NodeConfig
+        node = NodeConfig("http", "localhost", 9200)
+        meta = ApiResponseMeta(status=status, http_version="1.1",
+                               headers=HttpHeaders(), duration=0.0, node=node)
+        return es_exceptions.RequestError(msg, meta, {})
+
+    def test_400_bad_request_is_definitive(self):
         from financial_mcp.ingest import _is_definitive_es_rejection
         exc = _make_bad_request_error("illegal_argument_exception", "bad")
         assert _is_definitive_es_rejection(exc) is True
 
-    def test_not_found_is_definitive(self):
+    def test_404_not_found_is_definitive(self):
         from financial_mcp.ingest import _is_definitive_es_rejection
         exc = _make_not_found_error()
         assert _is_definitive_es_rejection(exc) is True
 
-    def test_authorization_is_definitive(self):
+    def test_403_authorization_is_definitive(self):
         from financial_mcp.ingest import _is_definitive_es_rejection
         exc = _make_forbidden_error()
         assert _is_definitive_es_rejection(exc) is True
+
+    @staticmethod
+    def _make_api_error(status: int, msg: str = "error"):
+        """Build a generic ApiError with the given HTTP status for mock tests."""
+        from elasticsearch import exceptions as es_exceptions
+        from elastic_transport import ApiResponseMeta, HttpHeaders, NodeConfig
+        node = NodeConfig("http", "localhost", 9200)
+        meta = ApiResponseMeta(status=status, http_version="1.1",
+                               headers=HttpHeaders(), duration=0.0, node=node)
+        return es_exceptions.RequestError(msg, meta, {})
+
+    def test_408_request_timeout_is_ambiguous(self):
+        """408 Request Timeout: the timeout may originate from a proxy or
+        gateway in front of Elasticsearch; the alias update may have been
+        applied before the timeout was returned.  Classified as ambiguous."""
+        from financial_mcp.ingest import _is_definitive_es_rejection
+        exc = self._make_api_error(408, "request timeout")
+        assert _is_definitive_es_rejection(exc) is False
+
+    def test_429_too_many_requests_is_ambiguous(self):
+        """429 Too Many Requests: the server may have applied the update
+        before returning the rate-limit response.  Classified as ambiguous."""
+        from financial_mcp.ingest import _is_definitive_es_rejection
+        exc = self._make_api_error(429, "rate limit exceeded")
+        assert _is_definitive_es_rejection(exc) is False
+
+    def test_500_internal_server_error_is_ambiguous(self):
+        from financial_mcp.ingest import _is_definitive_es_rejection
+        exc = self._make_5xx_error(500, "internal server error")
+        assert _is_definitive_es_rejection(exc) is False, (
+            "5xx must be classified as update_outcome_unknown, not update_failed"
+        )
+
+    def test_502_bad_gateway_is_ambiguous(self):
+        from financial_mcp.ingest import _is_definitive_es_rejection
+        exc = self._make_5xx_error(502, "bad gateway")
+        assert _is_definitive_es_rejection(exc) is False
+
+    def test_503_service_unavailable_is_ambiguous(self):
+        from financial_mcp.ingest import _is_definitive_es_rejection
+        exc = self._make_5xx_error(503, "service unavailable")
+        assert _is_definitive_es_rejection(exc) is False
+
+    def test_504_gateway_timeout_is_ambiguous(self):
+        from financial_mcp.ingest import _is_definitive_es_rejection
+        exc = self._make_5xx_error(504, "gateway timeout")
+        assert _is_definitive_es_rejection(exc) is False
 
     def test_connection_timeout_is_ambiguous(self):
         from financial_mcp.ingest import _is_definitive_es_rejection
@@ -1349,21 +1411,46 @@ class TestIsDefinitiveEsRejection:
         from financial_mcp.ingest import _is_definitive_es_rejection
         assert _is_definitive_es_rejection(RuntimeError("unexpected")) is False
 
+    def test_302_redirect_is_ambiguous(self):
+        """302 is not in the definitive set (400, 403, 404) → ambiguous.
+        A redirect from Elasticsearch would be unexpected and the outcome
+        of the alias update is uncertain."""
+        from financial_mcp.ingest import _is_definitive_es_rejection
+        exc = self._make_api_error(302, "found")
+        assert _is_definitive_es_rejection(exc) is False
+
+    def test_api_error_without_status_meta_is_ambiguous(self):
+        """An ApiError whose meta has no status attribute (or meta is
+        None) must be classified as ambiguous (fail-safe)."""
+        from financial_mcp.ingest import _is_definitive_es_rejection
+        from elasticsearch import exceptions as es_exceptions
+        from elastic_transport import ApiResponseMeta, HttpHeaders, NodeConfig
+
+        node = NodeConfig("http", "localhost", 9200)
+        # Build an ApiError with meta=None (simulates missing metadata)
+        exc = es_exceptions.ApiError("error", None, {})
+        assert _is_definitive_es_rejection(exc) is False
+
 
 class TestUpdateOutcomeUnknown:
-    """When update_aliases raises a transport error (timeout, connection
-    reset) the outcome is ambiguous: the server may have applied the update
-    before the client received the error.  run_ingest must NOT delete the
-    staging index in this case.
+    """Exception classification for update_aliases failures:
 
-    When update_aliases raises a definitive Elasticsearch rejection
-    (ApiError subclass), the update was NOT applied; run_ingest may clean
-    up the staging index.
+    - HTTP 400, 403, 404 (definitive rejection): the server explicitly
+      rejected the request; the update was NOT applied.  run_ingest may
+      clean up the staging index.
+    - HTTP 408, 429, 5xx, or missing metadata (ambiguous): the server
+      may have applied the update before the error was returned.  run_ingest
+      must NOT delete the staging index.
+    - Transport errors (timeout, connection reset, SSL error): the request
+      may have reached the server.  run_ingest must NOT delete the
+      staging index.
+    - Non-ES exceptions: outcome is uncertain.  run_ingest must NOT
+      delete the staging index.
     """
 
-    def _run_with_update_exc(self, monkeypatch, exc, outcome_state=None):
-        """Patch _atomic_alias_switch's update_aliases to raise *exc*,
-        then run_ingest.  Returns (fake, result)."""
+    def _run_with_definitive_rejection(self, monkeypatch, exc):
+        """Simulate a 4xx definitive rejection: the exception is raised
+        BEFORE any alias mutation occurs.  Returns (fake, result)."""
         import financial_mcp.ingest as mod
         import tempfile, json as _json
 
@@ -1374,27 +1461,211 @@ class TestUpdateOutcomeUnknown:
             data_path = f.name
 
         fake = _make_full_fake(monkeypatch)
-        _patch_staging(monkeypatch, "stg-unknown")
+        _patch_staging(monkeypatch, "stg-def")
         _mock_bulk(monkeypatch, success=2)
         fake.indices.existing_indexes.add("stg-old")
         fake.indices.existing_aliases[mod.ES_INDEX] = "stg-old"
 
-        # Patch update_aliases to raise the given exception
-        _indices = fake.indices
-        orig_update = _indices.update_aliases
-        def _raise_update(actions, **kw):
-            orig_update(actions, **kw)
-            raise exc
-        fake.indices.update_aliases = _raise_update
+        # Raise BEFORE mutating: the alias dict must remain unchanged.
+        fake.indices.update_aliases = lambda actions, **kw: (_ for _ in ()).throw(exc)
         _patch_client(monkeypatch, fake)
 
         result = mod.run_ingest(data_path)
         return fake, result
 
+    def _run_with_ambiguous_update(self, monkeypatch, exc):
+        """Simulate an ambiguous failure (5xx ApiError or transport error):
+        the alias update IS applied in the fake server first, then the
+        exception is raised.  This models the real-world scenario where
+        the server applied the update but the client received an error.
+        Returns (fake, result)."""
+        import financial_mcp.ingest as mod
+        import tempfile, json as _json
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False, encoding="utf-8"
+        ) as f:
+            _json.dump(_valid_docs(), f)
+            data_path = f.name
+
+        fake = _make_full_fake(monkeypatch)
+        _patch_staging(monkeypatch, "stg-amb")
+        _mock_bulk(monkeypatch, success=2)
+        fake.indices.existing_indexes.add("stg-old")
+        fake.indices.existing_aliases[mod.ES_INDEX] = "stg-old"
+
+        # Apply the alias update in the fake, THEN raise:
+        # models the server applying the update before returning the error.
+        _indices = fake.indices
+        orig_update = _indices.update_aliases
+        def _apply_then_raise(actions, **kw):
+            orig_update(actions, **kw)
+            raise exc
+        fake.indices.update_aliases = _apply_then_raise
+        _patch_client(monkeypatch, fake)
+
+        result = mod.run_ingest(data_path)
+        return fake, result
+
+    @staticmethod
+    def _make_500_error(msg: str = "internal server error"):
+        """Build a real 5xx ApiError for mock tests."""
+        from elasticsearch import exceptions as es_exceptions
+        from elastic_transport import ApiResponseMeta, HttpHeaders, NodeConfig
+        node = NodeConfig("http", "localhost", 9200)
+        meta = ApiResponseMeta(status=500, http_version="1.1",
+                               headers=HttpHeaders(), duration=0.0, node=node)
+        return es_exceptions.RequestError(msg, meta, {})
+
+    @staticmethod
+    def _make_408_error(msg: str = "request timeout"):
+        """Build a real HTTP 408 ApiError for mock tests."""
+        from elasticsearch import exceptions as es_exceptions
+        from elastic_transport import ApiResponseMeta, HttpHeaders, NodeConfig
+        node = NodeConfig("http", "localhost", 9200)
+        meta = ApiResponseMeta(status=408, http_version="1.1",
+                               headers=HttpHeaders(), duration=0.0, node=node)
+        return es_exceptions.RequestError(msg, meta, {})
+
+    @staticmethod
+    def _make_429_error(msg: str = "rate limit exceeded"):
+        """Build a real HTTP 429 ApiError for mock tests."""
+        from elasticsearch import exceptions as es_exceptions
+        from elastic_transport import ApiResponseMeta, HttpHeaders, NodeConfig
+        node = NodeConfig("http", "localhost", 9200)
+        meta = ApiResponseMeta(status=429, http_version="1.1",
+                               headers=HttpHeaders(), duration=0.0, node=node)
+        return es_exceptions.RequestError(msg, meta, {})
+
+    def test_definitive_4xx_rejection_cleans_up_staging(self, monkeypatch):
+        """update_aliases raises a definitive 4xx rejection (e.g. 403)
+        BEFORE mutating the alias → update_failed → staging may be
+        cleaned up; the alias still points to the previous index."""
+        import financial_mcp.ingest as mod
+        fake, result = self._run_with_definitive_rejection(
+            monkeypatch, _make_forbidden_error("forbidden"),
+        )
+        assert not result.success
+        assert "update_failed" in result.error
+        # The alias was NOT mutated (rejection happened before the update)
+        assert fake.indices.existing_aliases.get(mod.ES_INDEX) == "stg-old", (
+            "alias still points to the previous index after definitive rejection"
+        )
+        # Staging WAS cleaned up (this run owns it; alias state is unambiguous)
+        assert fake.deleted == "stg-def"
+        # Previous index was NOT deleted
+        assert "stg-old" in fake.indices.existing_indexes
+        assert result.previous_index_kept is True
+        assert result.previous_active == "stg-old"
+
+    def test_definitive_4xx_bad_request_cleans_up_staging(self, monkeypatch):
+        """A 400 rejection is also definitive — the server rejected the
+        request, the update was NOT applied."""
+        import financial_mcp.ingest as mod
+        fake, result = self._run_with_definitive_rejection(
+            monkeypatch,
+            _make_bad_request_error("illegal_argument_exception", "invalid action"),
+        )
+        assert not result.success
+        assert "update_failed" in result.error
+        assert fake.indices.existing_aliases.get(mod.ES_INDEX) == "stg-old"
+        assert fake.deleted == "stg-def"
+        assert "stg-old" in fake.indices.existing_indexes
+
+    def test_5xx_server_error_is_ambiguous(self, monkeypatch):
+        """A 500 ApiError is treated as update_outcome_unknown: the server
+        may have applied the alias update before returning the error.
+        Staging is preserved; the alias may now target the staging index."""
+        import financial_mcp.ingest as mod
+        fake, result = self._run_with_ambiguous_update(
+            monkeypatch, self._make_500_error(),
+        )
+        assert not result.success
+        assert "update_outcome_unknown" in result.error
+        # Staging was NOT deleted (alias may target it)
+        assert fake.deleted is None, (
+            "staging index was deleted despite ambiguous 5xx outcome -- "
+            "the server may have applied the alias update"
+        )
+        # The fake alias was mutated before the error (models server applying
+        # the update before returning 500)
+        assert fake.indices.existing_aliases.get(mod.ES_INDEX) == "stg-amb", (
+            "fake alias now targets the staging index (update was applied "
+            "before the 500 error was returned)"
+        )
+        # Previous index is preserved (NOT deleted)
+        assert "stg-old" in fake.indices.existing_indexes
+        assert result.previous_index_kept is True
+
+    def test_408_timeout_is_ambiguous_via_run_ingest(self, monkeypatch):
+        """HTTP 408 via run_ingest(): the alias is applied before the error
+        is raised (models a proxy timeout after the update was applied).
+        The outcome must be update_outcome_unknown; staging must be
+        preserved; the previous index must not be deleted; the alias must
+        never point to a deleted index."""
+        import financial_mcp.ingest as mod
+        fake, result = self._run_with_ambiguous_update(
+            monkeypatch, self._make_408_error(),
+        )
+        assert not result.success
+        assert "update_outcome_unknown" in result.error
+        # Staging was NOT deleted
+        assert fake.deleted is None, (
+            "staging index was deleted despite ambiguous 408 outcome -- "
+            "the alias update may have been applied before the timeout"
+        )
+        # Previous index still exists (NOT deleted)
+        assert "stg-old" in fake.indices.existing_indexes
+        assert result.previous_index_kept is True
+        # The alias points to the staging index (it was applied before the error)
+        assert fake.indices.existing_aliases.get(mod.ES_INDEX) == "stg-amb", (
+            "alias should now target the staging index (update was applied "
+            "before the 408 timeout was returned)"
+        )
+        # Alias must never point to a deleted index
+        alias_target = fake.indices.existing_aliases.get(mod.ES_INDEX)
+        assert alias_target in fake.indices.existing_indexes, (
+            f"alias targets {alias_target!r} which is not in the existing "
+            f"index set {fake.indices.existing_indexes}"
+        )
+
+    def test_429_rate_limit_is_ambiguous_via_run_ingest(self, monkeypatch):
+        """HTTP 429 via run_ingest(): the alias is applied before the error
+        is raised (models a rate-limit response after the update was applied).
+        The outcome must be update_outcome_unknown; staging must be
+        preserved; the previous index must not be deleted; the alias must
+        never point to a deleted index."""
+        import financial_mcp.ingest as mod
+        fake, result = self._run_with_ambiguous_update(
+            monkeypatch, self._make_429_error(),
+        )
+        assert not result.success
+        assert "update_outcome_unknown" in result.error
+        # Staging was NOT deleted
+        assert fake.deleted is None, (
+            "staging index was deleted despite ambiguous 429 outcome -- "
+            "the alias update may have been applied before the rate-limit response"
+        )
+        # Previous index still exists (NOT deleted)
+        assert "stg-old" in fake.indices.existing_indexes
+        assert result.previous_index_kept is True
+        # The alias points to the staging index (it was applied before the error)
+        assert fake.indices.existing_aliases.get(mod.ES_INDEX) == "stg-amb", (
+            "alias should now target the staging index (update was applied "
+            "before the 429 response was returned)"
+        )
+        # Alias must never point to a deleted index
+        alias_target = fake.indices.existing_aliases.get(mod.ES_INDEX)
+        assert alias_target in fake.indices.existing_indexes, (
+            f"alias targets {alias_target!r} which is not in the existing "
+            f"index set {fake.indices.existing_indexes}"
+        )
+
     def test_transport_timeout_preserves_staging(self, monkeypatch):
         """update_aliases raises ConnectionTimeout → update_outcome_unknown →
         staging must NOT be deleted (the server may have applied it)."""
-        fake, result = self._run_with_update_exc(
+        import financial_mcp.ingest as mod
+        fake, result = self._run_with_ambiguous_update(
             monkeypatch, _make_transport_error("request timed out"),
         )
         assert not result.success
@@ -1403,29 +1674,24 @@ class TestUpdateOutcomeUnknown:
             "staging index was deleted despite ambiguous update outcome -- "
             "the server may have applied the alias update"
         )
-        assert "stg-unknown" in fake.indices.existing_indexes
+        # The fake alias was mutated before the error
+        assert fake.indices.existing_aliases.get(mod.ES_INDEX) == "stg-amb"
+        assert "stg-amb" in fake.indices.existing_indexes
         assert result.previous_index_kept is True
 
     def test_connection_reset_preserves_staging(self, monkeypatch):
         """update_aliases raises ConnectionError (reset) →
         update_outcome_unknown → staging must NOT be deleted."""
-        fake, result = self._run_with_update_exc(
+        import financial_mcp.ingest as mod
+        fake, result = self._run_with_ambiguous_update(
             monkeypatch, _make_connection_error("connection reset"),
         )
         assert not result.success
         assert "update_outcome_unknown" in result.error
         assert fake.deleted is None
-        assert "stg-unknown" in fake.indices.existing_indexes
-
-    def test_definitive_rejection_cleans_up_staging(self, monkeypatch):
-        """update_aliases raises a definitive ApiError (e.g. 403) →
-        update_failed → staging may be cleaned up (update was NOT applied)."""
-        fake, result = self._run_with_update_exc(
-            monkeypatch, _make_forbidden_error("forbidden"),
-        )
-        assert not result.success
-        assert "update_failed" in result.error
-        assert fake.deleted == "stg-unknown"
+        # The fake alias was mutated before the error
+        assert fake.indices.existing_aliases.get(mod.ES_INDEX) == "stg-amb"
+        assert "stg-amb" in fake.indices.existing_indexes
 
     def test_postcondition_read_fails_after_successful_update_preserves_staging(
         self, monkeypatch,
