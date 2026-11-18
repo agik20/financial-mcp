@@ -159,7 +159,9 @@ def _mock_verify(monkeypatch, fake, expected_index):
     Realistic ES 8.x response structures are used.
     """
     fake.count = lambda index: {"count": 2}
-    fake.search = lambda index, **kw: MagicMock(body={"hits": {"total": {"value": 1}}})
+    fake.search = lambda index, **kw: MagicMock(
+        body={"hits": {"total": {"value": 1}, "hits": [{"_id": "doc-1"}]}}
+    )
     # _verify_staging calls client.indices.get(index=staging) to confirm existence
     fake.indices.get = lambda index: {expected_index: {}}
     # _verify_staging calls client.cat.indices(index=staging) to confirm state=open
@@ -208,7 +210,7 @@ def _make_full_fake(monkeypatch):
     fake.refresh = lambda index: None
     fake.count = lambda index: {"count": 2}
     fake.search = lambda index, **kw: MagicMock(
-        body={"hits": {"total": {"value": 1}, "hits": []}}
+        body={"hits": {"total": {"value": 1}, "hits": [{"_id": "doc-1"}]}}
     )
     fake.cluster = MagicMock()
     fake.cluster.health = lambda index: MagicMock(
@@ -352,7 +354,9 @@ class TestRunIngest:
         _patch_staging(monkeypatch, "staging-001")
         _mock_bulk(monkeypatch, success=2)
         fake.count = lambda index: {"count": 1}
-        fake.search = lambda index, **kw: MagicMock(body={"hits": {"total": {"value": 1}}})
+        fake.search = lambda index, **kw: MagicMock(
+        body={"hits": {"total": {"value": 1}, "hits": [{"_id": "doc-1"}]}}
+    )
         fake.indices.stats = lambda index: MagicMock(
             body={"indices": {"staging-001": {"primaries": {"state": "open", "unassigned_shards": 0}}}}
         )
@@ -442,7 +446,9 @@ class TestStagingHealthVerificationFailure:
         from financial_mcp.ingest import _verify_staging
         fake = _make_full_fake(monkeypatch)
         fake.count = lambda index: {"count": 2}
-        fake.search = lambda index, **kw: MagicMock(body={"hits": {"total": {"value": 1}}})
+        fake.search = lambda index, **kw: MagicMock(
+        body={"hits": {"total": {"value": 1}, "hits": [{"_id": "doc-1"}]}}
+    )
         fake.indices.get = lambda index: {"stg-hv": {}}
         fake.cluster = MagicMock()
         fake.cluster.health = lambda index: MagicMock(
@@ -456,7 +462,9 @@ class TestStagingHealthVerificationFailure:
         from financial_mcp.ingest import _verify_staging
         fake = _make_full_fake(monkeypatch)
         fake.count = lambda index: {"count": 2}
-        fake.search = lambda index, **kw: MagicMock(body={"hits": {"total": {"value": 1}}})
+        fake.search = lambda index, **kw: MagicMock(
+        body={"hits": {"total": {"value": 1}, "hits": [{"_id": "doc-1"}]}}
+    )
         fake.indices.get = lambda index: {"stg-hv": {}}
         fake.cluster = MagicMock()
         fake.cluster.health = lambda index: MagicMock(
@@ -472,7 +480,9 @@ class TestStagingHealthVerificationFailure:
         from financial_mcp.ingest import _verify_staging
         fake = _make_full_fake(monkeypatch)
         fake.count = lambda index: {"count": 2}
-        fake.search = lambda index, **kw: MagicMock(body={"hits": {"total": {"value": 1}}})
+        fake.search = lambda index, **kw: MagicMock(
+        body={"hits": {"total": {"value": 1}, "hits": [{"_id": "doc-1"}]}}
+    )
         fake.indices.get = lambda index: {"stg-closed": {}}
         fake.cluster = MagicMock()
         fake.cluster.health = lambda index: MagicMock(
@@ -490,7 +500,9 @@ class TestStagingHealthVerificationFailure:
         from financial_mcp.ingest import _verify_staging
         fake = _make_full_fake(monkeypatch)
         fake.count = lambda index: {"count": 2}
-        fake.search = lambda index, **kw: MagicMock(body={"hits": {"total": {"value": 1}}})
+        fake.search = lambda index, **kw: MagicMock(
+        body={"hits": {"total": {"value": 1}, "hits": [{"_id": "doc-1"}]}}
+    )
         # Simulate: the index was deleted between creation and verification
         fake.indices.get = lambda index: {}  # empty -- index not in returned dict
         with pytest.raises(RuntimeError, match="not found after creation"):
@@ -502,7 +514,9 @@ class TestStagingHealthVerificationFailure:
         from financial_mcp.ingest import _verify_staging
         fake = _make_full_fake(monkeypatch)
         fake.count = lambda index: {"count": 2}
-        fake.search = lambda index, **kw: MagicMock(body={"hits": {"total": {"value": 1}}})
+        fake.search = lambda index, **kw: MagicMock(
+        body={"hits": {"total": {"value": 1}, "hits": [{"_id": "doc-1"}]}}
+    )
         fake.indices.get = lambda index: {"stg-yellow": {}}
         fake.cat.indices = lambda index, **kw: [{"index": index, "status": "open", "health": "yellow"}]
         fake.cluster = MagicMock()
@@ -518,7 +532,9 @@ class TestStagingHealthVerificationFailure:
         from financial_mcp.ingest import _verify_staging
         fake = _make_full_fake(monkeypatch)
         fake.count = lambda index: {"count": 2}
-        fake.search = lambda index, **kw: MagicMock(body={"hits": {"total": {"value": 1}}})
+        fake.search = lambda index, **kw: MagicMock(
+        body={"hits": {"total": {"value": 1}, "hits": [{"_id": "doc-1"}]}}
+    )
         fake.indices.get = lambda index: {"stg-open": {}}
         # _make_full_fake already sets cat.indices with state='open'
         fake.cluster = MagicMock()
@@ -880,7 +896,9 @@ class TestVerifyStagingStateFailClosed:
         import financial_mcp.ingest as mod
         fake = _make_full_fake(monkeypatch)
         fake.count = lambda index: {"count": 2}
-        fake.search = lambda index, **kw: MagicMock(body={"hits": {"total": {"value": 1}}})
+        fake.search = lambda index, **kw: MagicMock(
+        body={"hits": {"total": {"value": 1}, "hits": [{"_id": "doc-1"}]}}
+    )
         fake.indices.get = lambda index: {index: {}}
         fake.cat = MagicMock()
         fake.cat.indices = cat_fn

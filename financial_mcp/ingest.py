@@ -315,7 +315,9 @@ def _resolve_alias_target(client: Elasticsearch) -> Optional[str]:
             "manual resolution required before ingestion"
         )
     only_key = next(iter(mapping))
-    if ES_INDEX in mapping[only_key]:
+    # ES 8.x returns {'index': {'aliases': {'alias_name': {}}}}
+    aliases = mapping[only_key].get("aliases", mapping[only_key])
+    if ES_INDEX in aliases:
         return only_key
     return None
 
@@ -533,9 +535,10 @@ def _verify_staging(client: Elasticsearch, staging: str,
         index=staging,
         body={"query": {"match_all": {}}, "size": 1},
     ).body
-    if sample["hits"]["total"]["value"] != 1:
+    if len(sample["hits"]["hits"]) < 1:
         raise RuntimeError(
-            f"spot-fetch expected 1 doc, got {sample['hits']['total']['value']}"
+            f"spot-fetch returned 0 docs from {staging!r} -- "
+            "refusing to activate an empty index"
         )
 
     # 5. Cluster health for the specific index.
