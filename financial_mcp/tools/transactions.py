@@ -20,13 +20,16 @@ def register_transaction_tools(mcp: FastMCP) -> None:
     async def get_all_transactions() -> str:
         """Get the most recent 50 financial transactions.
 
+        The list is sorted descending by ``transaction_date`` and returns
+        canonical 12-field transaction documents.
+
         Returns:
             A JSON string containing the total record count, the number
             of records returned, and the list of transaction objects.
         """
         query: Dict[str, Any] = {
             "size": 50,
-            "sort": [{"creationDate": {"order": "desc"}}],
+            "sort": [{"transaction_date": {"order": "desc"}}],
             "query": {"match_all": {}},
         }
         data = await query_elasticsearch(query)
@@ -53,6 +56,28 @@ def register_transaction_tools(mcp: FastMCP) -> None:
     ) -> str:
         """Query financial transactions with filters and optional aggregation.
 
+        Filters use the canonical transaction schema:
+
+        * Date range on ``transaction_date``.
+        * Type filter (``Income`` / ``Expense`` / ``Transfer``).
+        * Category filter.
+        * Source account filter (``source_account``; the legacy
+          ``source_name`` parameter still works and is folded into
+          ``source_account`` by the model).
+
+        When ``params.aggregation`` is set, the response contains
+        time-series buckets keyed on ``transaction_date`` with the correct
+        signed-amount semantics:
+
+        * ``total_expense``  -- sum of *amount* for expense documents
+          (positive magnitude of outflows).
+        * ``total_income``   -- sum of *signed_amount* for income documents
+          (positive or zero).
+        * ``net``            -- ``total_income - total_expense``.
+          Transfer transactions are **excluded** from the net figure;
+          they represent money moving between the owner's own accounts
+          and must not count as gains or losses.
+
         Args:
             params: Filter / aggregation parameters (see
                 :class:`QueryTransactionParams`).
@@ -63,27 +88,30 @@ def register_transaction_tools(mcp: FastMCP) -> None:
         """
         must_clauses: list[Dict[str, Any]] = []
 
-        # Date range filter
+        # Date range filter on the canonical date field.
         if params.start_date or params.end_date:
             date_range: Dict[str, str] = {}
             if params.start_date:
                 date_range["gte"] = params.start_date
             if params.end_date:
                 date_range["lte"] = params.end_date
-            must_clauses.append({"range": {"day": date_range}})
+            must_clauses.append(
+                {"range": {"transaction_date": date_range}}
+            )
 
-        # Type filter
+        # Type filter (canonical: Income / Expense / Transfer).
         if params.type:
             must_clauses.append({"term": {"type": params.type}})
 
-        # Category filter
+        # Category filter.
         if params.category:
             must_clauses.append({"term": {"category": params.category}})
 
-        # Source filter
-        if params.source_name:
+        # Source account filter (canonical ``source_account``; the legacy
+        # ``source_name`` parameter is folded in by the Pydantic model).
+        if params.effective_source_account:
             must_clauses.append(
-                {"term": {"sourceName": params.source_name}},
+                {"term": {"source_account": params.effective_source_account}},
             )
 
         es_query: Dict[str, Any] = {
@@ -96,7 +124,7 @@ def register_transaction_tools(mcp: FastMCP) -> None:
             "sort": (
                 []
                 if params.aggregation
-                else [{"creationDate": {"order": "desc"}}]
+                else [{"transaction_date": {"order": "desc"}}]
             ),
         }
 
@@ -108,10 +136,14 @@ def register_transaction_tools(mcp: FastMCP) -> None:
                 "monthly": "1M",
             }
             calendar_interval = interval_map[params.aggregation]
+            # ``total_expense`` sums ``amount`` for expense documents;
+            # ``total_income`` sums ``signed_amount`` for income documents.
+            # ``net`` is computed client-side as total_income - total_expense
+            # so Transfer transactions are excluded by construction.
             es_query["aggs"] = {
                 "time_series": {
                     "date_histogram": {
-                        "field": "day",
+                        "field": "transaction_date",
                         "calendar_interval": calendar_interval,
                         "min_doc_count": 1,
                     },
@@ -119,28 +151,17 @@ def register_transaction_tools(mcp: FastMCP) -> None:
                         "total_expense": {
                             "filter": {"term": {"type": "Expense"}},
                             "aggs": {
-                                "sum": {"sum": {"field": "value"}}
+                                "sum": {"sum": {"field": "amount"}}
                             },
                         },
                         "total_income": {
                             "filter": {"term": {"type": "Income"}},
                             "aggs": {
-                                "sum": {"sum": {"field": "value"}}
+                                "sum": {"sum": {"field": "signed_amount"}}
                             },
                         },
-                        "net": {
-                            "sum": {
-                                "script": {
-                                    "source": (
-                                        "doc['type'].value == 'Income' "
-                                        "? doc['value'].value "
-                                        ": -doc['value'].value"
-                                    )
-                                }
-                            }
-                        },
                         "tx_count": {
-                            "value_count": {"field": "value"}
+                            "value_count": {"field": "signed_amount"}
                         },
                     },
                 }
@@ -159,13 +180,15 @@ def register_transaction_tools(mcp: FastMCP) -> None:
             )
             result: list[Dict[str, Any]] = []
             for b in buckets:
+                te = b["total_expense"]["sum"]["value"]
+                ti = b["total_income"]["sum"]["value"]
                 result.append(
                     {
                         "period": b["key_as_string"],
-                        "total_expense": b["total_expense"]["sum"]["value"],
-                        "total_income": b["total_income"]["sum"]["value"],
-                        "net": b["net"]["value"],
-                        "tx_count": b["tx_count"]["value"],
+                        "total_expense": te,
+                        "total_income": ti,
+                        "net": ti - te,
+                        "tx_count": int(b["tx_count"]["value"]),
                     }
                 )
 
