@@ -59,6 +59,14 @@ def parse_date(date_val: Any) -> Optional[pd.Timestamp]:
 
 
 
+def _str_or_none(value: Any) -> Optional[str]:
+    """Return the stripped string, or None when the value is NaN or empty."""
+    if pd.isna(value):
+        return None
+    s = str(value).strip()
+    return s if s else None
+
+
 def transform_row(row: pd.Series) -> Dict[str, Any]:
     """Transform a CSV row into the canonical transaction schema."""
 
@@ -75,16 +83,11 @@ def transform_row(row: pd.Series) -> Dict[str, Any]:
         "type": row["Type"],
         "parent_category": row["Parent"],
         "source_account": row["Account"],
-        "destination_account": (
-            None
-            if pd.isna(row["Destination Account"])
-            or not str(row["Destination Account"]).strip()
-            else str(row["Destination Account"]).strip()
-        ),
+        "destination_account": _str_or_none(row["Destination Account"]),
         "amount": clean_currency(row["Amount"]),
         "signed_amount": clean_currency(row["Signed Amount"]),
         "currency": "IDR",
-        "description": row["Detail Transaction"],
+        "description": _str_or_none(row["Detail Transaction"]),
         "pay_cycle": (
             pay_cycle.strftime("%Y-%m-%d")
             if pay_cycle is not None else None
@@ -125,7 +128,7 @@ def convert_csv_to_json() -> None:
 
     # -- Save ----------------------------------------------------------------
     with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(records, f, indent=2)
+        json.dump(records, f, indent=2, allow_nan=False)
 
     print(f"Done. Output saved to {output_file}")
 
