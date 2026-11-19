@@ -67,6 +67,14 @@ def register_analytics_tools(mcp: FastMCP) -> None:
                 {"range": {"transaction_date": date_range}}
             )
 
+        if params.category:
+            must_clauses.append({"term": {"category": params.category}})
+
+        if params.effective_source_account:
+            must_clauses.append(
+                {"term": {"source_account": params.effective_source_account}}
+            )
+
         # Sum ``amount`` (positive magnitude) for the requested type.  For
         # expenses this is the spending total; for income it would be the
         # total received.  The tool name says "spending" but the filter is
@@ -176,7 +184,14 @@ def register_analytics_tools(mcp: FastMCP) -> None:
                     },
                     "aggs": {
                         "terms": {
-                            "terms": {"field": "category", "size": 10},
+                            "terms": {
+                                "field": "category",
+                                "size": 10,
+                                "order": [
+                                    {"total": "desc"},
+                                    {"_key": "asc"},
+                                ],
+                            },
                             "aggs": {
                                 "total": {"sum": {"field": "amount"}}
                             },
@@ -202,6 +217,7 @@ def register_analytics_tools(mcp: FastMCP) -> None:
             {"category": b["key"], "total": b["total"]["value"]}
             for b in by_cat_terms["buckets"]
         ]
+        top_categories.sort(key=lambda c: (-c["total"], c["category"]))
 
         return json.dumps(
             {
