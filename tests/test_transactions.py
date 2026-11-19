@@ -227,6 +227,258 @@ class TestQueryTransactions:
             json.loads(await tool(QueryTransactionParams(aggregation=agg)))
             assert captured["query"]["aggs"]["time_series"]["date_histogram"]["calendar_interval"] == expected_interval
 
+# ---------------------------------------------------------------------------
+# F-001: Completeness metadata tests
+# ---------------------------------------------------------------------------
+
+
+def _make_hits(value: int, relation: str, n_records: int) -> dict:
+    """Build a synthetic ES response body with *n_records* hits."""
+    hits = [
+        {"_source": {"transaction_date": "2026-01-01", "amount": i, "signed_amount": i}}
+        for i in range(n_records)
+    ]
+    return {"hits": {"total": {"value": value, "relation": relation}, "hits": hits}}
+
+
+class TestQueryConstruction:
+    @pytest.mark.asyncio
+    async def test_get_all_includes_track_total_hits(self, mcp, monkeypatch):
+        import financial_mcp.tools.transactions as mod
+        captured = {}
+
+        async def fake(q):
+            captured["q"] = q
+            return _make_hits(1, "eq", 1)
+
+        monkeypatch.setattr(mod, "query_elasticsearch", fake)
+        tool = mcp._tool_manager._tools["get_all_transactions"].fn
+        json.loads(await tool())
+        assert captured["q"].get("track_total_hits") is True
+
+    @pytest.mark.asyncio
+    async def test_query_raw_includes_track_total_hits(self, mcp, monkeypatch):
+        import financial_mcp.tools.transactions as mod
+        captured = {}
+
+        async def fake(q):
+            captured["q"] = q
+            return _make_hits(0, "eq", 0)
+
+        monkeypatch.setattr(mod, "query_elasticsearch", fake)
+        tool = mcp._tool_manager._tools["query_transactions"].fn
+        json.loads(await tool(QueryTransactionParams()))
+        assert captured["q"].get("track_total_hits") is True
+
+    @pytest.mark.asyncio
+    async def test_query_agg_does_not_force_track_total_hits(self, mcp, monkeypatch):
+        """Aggregation mode does not set track_total_hits -- exact hit
+        tracking is only needed for raw-record completeness metadata."""
+        import financial_mcp.tools.transactions as mod
+        captured = {}
+
+        async def fake(q):
+            captured["q"] = q
+            return {"aggregations": {"time_series": {"buckets": []}}}
+
+        monkeypatch.setattr(mod, "query_elasticsearch", fake)
+        tool = mcp._tool_manager._tools["query_transactions"].fn
+        json.loads(await tool(QueryTransactionParams(aggregation="daily")))
+        assert captured["q"].get("track_total_hits") is not True
+
+
+class TestCompletenessMetadata:
+    """F-001 Cases A-F for query_transactions raw mode."""
+
+    @pytest.mark.asyncio
+    async def test_case_a_more_records_eq(self, mcp, monkeypatch):
+        import financial_mcp.tools.transactions as mod
+        resp = _make_hits(15000, "eq", 50)
+
+        async def fake(q):
+            return resp
+
+        monkeypatch.setattr(mod, "query_elasticsearch", fake)
+        tool = mcp._tool_manager._tools["query_transactions"].fn
+        result = json.loads(await tool(QueryTransactionParams()))
+        assert result["total_matched"] == 15000
+        assert result["returned"] == 50
+        assert result["has_more"] is True
+        assert result["total_relation"] == "eq"
+
+    @pytest.mark.asyncio
+    async def test_case_b_all_returned_eq(self, mcp, monkeypatch):
+        import financial_mcp.tools.transactions as mod
+        resp = _make_hits(50, "eq", 50)
+
+        async def fake(q):
+            return resp
+
+        monkeypatch.setattr(mod, "query_elasticsearch", fake)
+        tool = mcp._tool_manager._tools["query_transactions"].fn
+        result = json.loads(await tool(QueryTransactionParams()))
+        assert result["has_more"] is False
+        assert result["total_relation"] == "eq"
+        assert result["total_matched"] == 50
+        assert result["returned"] == 50
+        assert isinstance(result["total_matched"], int)
+        assert isinstance(result["returned"], int)
+        assert isinstance(result["data"], list)
+
+    @pytest.mark.asyncio
+    async def test_case_c_empty_eq(self, mcp, monkeypatch):
+        import financial_mcp.tools.transactions as mod
+        resp = _make_hits(0, "eq", 0)
+
+        async def fake(q):
+            return resp
+
+        monkeypatch.setattr(mod, "query_elasticsearch", fake)
+        tool = mcp._tool_manager._tools["query_transactions"].fn
+        result = json.loads(await tool(QueryTransactionParams()))
+        assert result["total_matched"] == 0
+        assert result["returned"] == 0
+        assert result["has_more"] is False
+        assert result["data"] == []
+
+    @pytest.mark.asyncio
+    async def test_case_d_lower_bound_gte_more(self, mcp, monkeypatch):
+        import financial_mcp.tools.transactions as mod
+        resp = _make_hits(10000, "gte", 50)
+
+        async def fake(q):
+            return resp
+
+        monkeypatch.setattr(mod, "query_elasticsearch", fake)
+        tool = mcp._tool_manager._tools["query_transactions"].fn
+        result = json.loads(await tool(QueryTransactionParams()))
+        assert result["has_more"] is True
+        assert result["total_relation"] == "gte"
+        assert result["total_matched"] == 10000
+
+    @pytest.mark.asyncio
+    async def test_case_e_lower_bound_gte_ambiguous(self, mcp, monkeypatch):
+        import financial_mcp.tools.transactions as mod
+        # gte with total == returned: completeness unknown -> has_more is null (None)
+        resp = _make_hits(10000, "gte", 10000)
+
+        async def fake(q):
+            return resp
+
+        monkeypatch.setattr(mod, "query_elasticsearch", fake)
+        tool = mcp._tool_manager._tools["query_transactions"].fn
+        result = json.loads(await tool(QueryTransactionParams()))
+        assert result["has_more"] is None
+        assert result["total_relation"] == "gte"
+        assert result["has_more"] is not False
+
+    @pytest.mark.asyncio
+    async def test_case_f_legacy_scalar_total(self, mcp, monkeypatch):
+        import financial_mcp.tools.transactions as mod
+        # Legacy ES 7.x shape: hits.total is a plain int
+        resp = {"hits": {"total": 50, "hits": [
+            {"_source": {"transaction_date": "2026-01-01"}},
+        ] * 50}}
+
+        async def fake(q):
+            return resp
+
+        monkeypatch.setattr(mod, "query_elasticsearch", fake)
+        tool = mcp._tool_manager._tools["query_transactions"].fn
+        result = json.loads(await tool(QueryTransactionParams()))
+        assert result["total_matched"] == 50
+        assert result["total_relation"] == "eq"
+        assert result["has_more"] is False
+
+
+class TestBackwardCompatibility:
+    @pytest.mark.asyncio
+    async def test_raw_response_has_all_original_fields(self, mcp, monkeypatch):
+        import financial_mcp.tools.transactions as mod
+        resp = _make_hits(5, "eq", 5)
+
+        async def fake(q):
+            return resp
+
+        monkeypatch.setattr(mod, "query_elasticsearch", fake)
+        tool = mcp._tool_manager._tools["query_transactions"].fn
+        result = json.loads(await tool(QueryTransactionParams()))
+        for key in ("total_matched", "returned", "data"):
+            assert key in result, f"missing original key: {key}"
+        assert isinstance(result["total_matched"], int)
+        assert isinstance(result["returned"], int)
+        assert isinstance(result["data"], list)
+
+    @pytest.mark.asyncio
+    async def test_get_all_response_preserves_total_records(self, mcp, monkeypatch):
+        import financial_mcp.tools.transactions as mod
+        resp = _make_hits(200, "eq", 50)
+
+        async def fake(q):
+            return resp
+
+        monkeypatch.setattr(mod, "query_elasticsearch", fake)
+        tool = mcp._tool_manager._tools["get_all_transactions"].fn
+        result = json.loads(await tool())
+        assert result["total_records"] == 200
+        assert result["returned"] == 50
+        assert isinstance(result["data"], list)
+        assert "has_more" not in result
+        assert "total_relation" not in result
+
+    @pytest.mark.asyncio
+    async def test_get_all_legacy_scalar_total(self, mcp, monkeypatch):
+        """F-004: get_all_transactions handles legacy scalar hits.total."""
+        import financial_mcp.tools.transactions as mod
+        resp = {
+            "hits": {
+                "total": 50,
+                "hits": [{"_source": {"transaction_date": "2026-01-01"}}] * 50,
+            }
+        }
+
+        async def fake(q):
+            return resp
+
+        monkeypatch.setattr(mod, "query_elasticsearch", fake)
+        tool = mcp._tool_manager._tools["get_all_transactions"].fn
+        result = json.loads(await tool())
+        assert result["total_records"] == 50
+        assert result["returned"] == 50
+        assert isinstance(result["data"], list)
+        assert "has_more" not in result
+        assert "total_relation" not in result
+
+    @pytest.mark.asyncio
+    async def test_agg_response_unchanged(self, mcp, monkeypatch):
+        import financial_mcp.tools.transactions as mod
+
+        async def fake(q):
+            return {
+                "aggregations": {
+                    "time_series": {
+                        "buckets": [
+                            {
+                                "key_as_string": "2026-01-01",
+                                "total_expense": {"sum": {"value": 100}},
+                                "total_income": {"sum": {"value": 50}},
+                                "tx_count": {"value": 2},
+                            }
+                        ]
+                    }
+                }
+            }
+
+        monkeypatch.setattr(mod, "query_elasticsearch", fake)
+        tool = mcp._tool_manager._tools["query_transactions"].fn
+        result = json.loads(await tool(QueryTransactionParams(aggregation="daily")))
+        assert set(result.keys()) == {"aggregation", "total_periods", "data"}
+        assert result["aggregation"] == "daily"
+        assert result["total_periods"] == 1
+        assert "has_more" not in result
+        assert "total_relation" not in result
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 

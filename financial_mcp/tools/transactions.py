@@ -1,12 +1,55 @@
 """MCP tools for querying raw financial transactions."""
 
 import json
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Tuple
 
 from mcp.server.fastmcp import FastMCP
 
 from financial_mcp.es_client import query_elasticsearch
 from financial_mcp.models import QueryTransactionParams
+
+
+def _parse_es_total(hits_total: Any) -> Tuple[int, str]:
+    """Normalise an Elasticsearch ``hits.total`` value.
+
+    Handles the ES 8.x dict shape ``{"value": N, "relation": "eq"}``
+    and the legacy scalar shape where ``hits.total`` is a plain integer
+    (exact count, implied ``"eq"``).
+
+    Returns:
+        A ``(total_value, relation)`` tuple.
+    """
+    if isinstance(hits_total, dict):
+        value = int(hits_total.get("value", 0))
+        relation = hits_total.get("relation", "eq")
+        # Fail closed: an unrecognised relation is treated as a lower
+        # bound, never as an exact count.
+        if relation not in ("eq", "gte"):
+            relation = "gte"
+        return value, relation
+    # Legacy / ES 7.x scalar: always treated as exact
+    return int(hits_total or 0), "eq"
+
+
+def _compute_has_more(
+    total_value: int,
+    returned: int,
+    relation: str,
+) -> Optional[bool]:
+    """Return the ``has_more`` value for a raw-record response.
+
+    Truth table (F-001 spec):
+    - eq + total > returned  -> True
+    - eq + total <= returned -> False
+    - gte + total > returned -> True
+    - gte + total <= returned-> None  (completeness unknown)
+    """
+    if relation == "eq":
+        return total_value > returned
+    # relation == "gte": total_value is a lower bound
+    if total_value > returned:
+        return True
+    return None
 
 
 def register_transaction_tools(mcp: FastMCP) -> None:
@@ -31,6 +74,7 @@ def register_transaction_tools(mcp: FastMCP) -> None:
             "size": 50,
             "sort": [{"transaction_date": {"order": "desc"}}],
             "query": {"match_all": {}},
+            "track_total_hits": True,
         }
         data = await query_elasticsearch(query)
         if not data:
@@ -40,9 +84,10 @@ def register_transaction_tools(mcp: FastMCP) -> None:
 
         hits = data["hits"]["hits"]
         records = [h["_source"] for h in hits]
+        total_records, _ = _parse_es_total(data["hits"]["total"])
         return json.dumps(
             {
-                "total_records": data["hits"]["total"]["value"],
+                "total_records": total_records,
                 "returned": len(records),
                 "data": records,
             },
@@ -203,6 +248,7 @@ def register_transaction_tools(mcp: FastMCP) -> None:
             )
 
         # No aggregation -- return raw records
+        es_query["track_total_hits"] = True
         data = await query_elasticsearch(es_query)
         if not data:
             return json.dumps(
@@ -211,10 +257,14 @@ def register_transaction_tools(mcp: FastMCP) -> None:
 
         hits = data["hits"]["hits"]
         records = [h["_source"] for h in hits]
+        total_matched, total_relation = _parse_es_total(data["hits"]["total"])
+        has_more = _compute_has_more(total_matched, len(records), total_relation)
         return json.dumps(
             {
-                "total_matched": data["hits"]["total"]["value"],
+                "total_matched": total_matched,
                 "returned": len(records),
+                "has_more": has_more,
+                "total_relation": total_relation,
                 "data": records,
             },
             indent=2,
