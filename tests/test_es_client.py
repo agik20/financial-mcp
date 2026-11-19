@@ -1,9 +1,12 @@
 import json
 from pathlib import Path
 from typing import Any, Dict, List
+from unittest import mock
 
 import pytest
+from elasticsearch import AsyncElasticsearch
 
+from financial_mcp import es_client
 from financial_mcp.es_client import (
     CATEGORY_MAPPING,
     PARENT_CATEGORY_MAP,
@@ -367,3 +370,58 @@ class TestMappings:
         for cat in CATEGORY_MAPPING:
             parents = [p for p, cats in PARENT_CATEGORY_MAP.items() if cat in cats]
             assert len(parents) == 1, repr(cat) + " in multiple parents: " + str(parents)
+
+
+class TestAsyncEsClient:
+    """Regression tests for the elasticsearch[async] dependency.
+
+    These prove that ``AsyncElasticsearch`` can be constructed -- which
+    requires ``aiohttp`` -- and that the async client lifecycle works,
+    without a live Elasticsearch cluster. ``AsyncElasticsearch`` is patched
+    with a MagicMock so the constructor never opens a network connection.
+    """
+
+    async def test_async_elasticsearch_constructs(self):
+        """Proves aiohttp is available: construction raises ValueError if not."""
+        client = AsyncElasticsearch(hosts=["http://localhost:9200"])
+        assert isinstance(client, AsyncElasticsearch)
+        await client.close()
+
+    async def test_get_async_es_client_closes_on_exit(self):
+        mock_cls = mock.MagicMock()
+        mock_cls.return_value.close = mock.AsyncMock()
+        with mock.patch.object(es_client, "AsyncElasticsearch", mock_cls):
+            async with es_client.get_async_es_client() as client:
+                assert client is mock_cls.return_value
+        mock_cls.return_value.close.assert_awaited_once()
+
+    async def test_get_async_es_client_passes_hosts(self):
+        mock_cls = mock.MagicMock()
+        mock_cls.return_value.close = mock.AsyncMock()
+        with mock.patch.object(es_client, "AsyncElasticsearch", mock_cls), \
+             mock.patch.object(es_client, "ES_API_KEY", None):
+            async with es_client.get_async_es_client():
+                pass
+        options = mock_cls.call_args.kwargs
+        assert options == {"hosts": [es_client.ES_HOST]}
+
+    async def test_get_async_es_client_passes_api_key_when_set(self):
+        mock_cls = mock.MagicMock()
+        mock_cls.return_value.close = mock.AsyncMock()
+        with mock.patch.object(es_client, "AsyncElasticsearch", mock_cls), \
+             mock.patch.object(es_client, "ES_API_KEY", "test-key-123"):
+            async with es_client.get_async_es_client():
+                pass
+        options = mock_cls.call_args.kwargs
+        assert options["hosts"] == [es_client.ES_HOST]
+        assert options["api_key"] == "test-key-123"
+
+    async def test_get_async_es_client_no_api_key_when_unset(self):
+        mock_cls = mock.MagicMock()
+        mock_cls.return_value.close = mock.AsyncMock()
+        with mock.patch.object(es_client, "AsyncElasticsearch", mock_cls), \
+             mock.patch.object(es_client, "ES_API_KEY", None):
+            async with es_client.get_async_es_client():
+                pass
+        options = mock_cls.call_args.kwargs
+        assert "api_key" not in options

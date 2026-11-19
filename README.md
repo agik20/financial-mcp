@@ -220,7 +220,7 @@ Current dependencies include:
 
 ```toml
 dependencies = [
-    "elasticsearch>=8.0.0,<9.0.0",
+    "elasticsearch[async]>=8.0.0,<9.0.0",
     "mcp[cli]>=1.26.0",
     "pydantic>=2.12.5",
     "pandas>=2.0.0",
