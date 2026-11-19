@@ -320,5 +320,284 @@ class TestTransferExclusionNumeric:
         assert te_agg["filter"]["term"]["type"] == "Expense"
 
 
+# ---------------------------------------------------------------------------
+# Bug 1 regression: missing category and source_account filters
+# ---------------------------------------------------------------------------
+
+class TestSpendingByCategoryFilters:
+    """Regression tests verifying that category and source_account filters
+    are included in the ES query when supplied via params."""
+
+    @staticmethod
+    def _fake_spending(captured, buckets=None):
+        async def fake_query(q):
+            captured["query"] = q
+            return {
+                "aggregations": {
+                    "grand_total": {"value": 0},
+                    "by_category": {
+                        "buckets": buckets or []
+                    },
+                }
+            }
+        return fake_query
+
+    def _must(self, q):
+        return q["query"]["bool"]["must"]
+
+    @pytest.mark.asyncio
+    async def test_category_only_filter(self, mcp, monkeypatch):
+        """Category without source_account: term on category present,
+        no source_account term."""
+        import financial_mcp.tools.analytics as mod
+        captured = {}
+        monkeypatch.setattr(
+            mod, "query_elasticsearch",
+            self._fake_spending(captured)
+        )
+        tool = mcp._tool_manager._tools["get_spending_by_category"].fn
+        json.loads(await tool(QueryTransactionParams(category="Food & Drink")))
+        must = self._must(captured["query"])
+        assert {"term": {"category": "Food & Drink"}} in must
+        # No source_account clause
+        assert not any("source_account" in c for c in must)
+
+    @pytest.mark.asyncio
+    async def test_source_account_only_filter(self, mcp, monkeypatch):
+        """source_account without category: term on source_account present,
+        no category term."""
+        import financial_mcp.tools.analytics as mod
+        captured = {}
+        monkeypatch.setattr(
+            mod, "query_elasticsearch",
+            self._fake_spending(captured)
+        )
+        tool = mcp._tool_manager._tools["get_spending_by_category"].fn
+        json.loads(await tool(QueryTransactionParams(source_account="BNI")))
+        must = self._must(captured["query"])
+        assert {"term": {"source_account": "BNI"}} in must
+        # No category clause
+        assert not any("category" in c for c in must)
+
+    @pytest.mark.asyncio
+    async def test_combined_category_and_source_account(self, mcp, monkeypatch):
+        """Both filters supplied: both terms present."""
+        import financial_mcp.tools.analytics as mod
+        captured = {}
+        monkeypatch.setattr(
+            mod, "query_elasticsearch",
+            self._fake_spending(captured)
+        )
+        tool = mcp._tool_manager._tools["get_spending_by_category"].fn
+        json.loads(
+            await tool(
+                QueryTransactionParams(
+                    category="Food & Drink", source_account="BNI"
+                )
+            )
+        )
+        must = self._must(captured["query"])
+        assert {"term": {"category": "Food & Drink"}} in must
+        assert {"term": {"source_account": "BNI"}} in must
+
+    @pytest.mark.asyncio
+    async def test_legacy_source_name_folds_to_source_account(self, mcp, monkeypatch):
+        """source_name (legacy) is folded into source_account by the
+        model validator and applied as a source_account term filter."""
+        import financial_mcp.tools.analytics as mod
+        captured = {}
+        monkeypatch.setattr(
+            mod, "query_elasticsearch",
+            self._fake_spending(captured)
+        )
+        tool = mcp._tool_manager._tools["get_spending_by_category"].fn
+        # Pass source_name directly (simulates an old MCP client)
+        params = QueryTransactionParams(source_name="BCA")
+        json.loads(await tool(params))
+        must = self._must(captured["query"])
+        assert {"term": {"source_account": "BCA"}} in must
+
+    @pytest.mark.asyncio
+    async def test_no_optional_filters_means_no_extra_terms(self, mcp, monkeypatch):
+        """When neither category nor source_account is supplied, the
+        must_clauses contain only type and (optionally) date range —
+        no category or source_account term."""
+        import financial_mcp.tools.analytics as mod
+        captured = {}
+        monkeypatch.setattr(
+            mod, "query_elasticsearch",
+            self._fake_spending(captured)
+        )
+        tool = mcp._tool_manager._tools["get_spending_by_category"].fn
+        json.loads(await tool(QueryTransactionParams()))
+        must = self._must(captured["query"])
+        # Exactly one clause: type=Expense
+        assert len(must) == 1
+        assert must[0] == {"term": {"type": "Expense"}}
+        assert not any("category" in c for c in must)
+        assert not any("source_account" in c for c in must)
+
+
+# ---------------------------------------------------------------------------
+# Bug 2 regression: top_categories terms aggregation ordering
+# ---------------------------------------------------------------------------
+
+class TestTopCategoriesRanking:
+    """Regression tests verifying the by_category terms aggregation in
+    get_financial_summary orders by total (desc) with _key (asc) tie-breaker,
+    and that the returned list is sorted the same way."""
+
+    @staticmethod
+    def _summary_with_buckets(buckets):
+        """Build a realistic ES 8.x summary response with custom buckets.
+
+        buckets: list of dicts with keys "key" and "total" (the
+        sub-aggregation value), matching the ES 8.x nesting:
+            aggregations.by_category.terms.buckets[].total.value
+        """
+        es_buckets = [
+            {"key": b["key"], "total": {"value": b["total"]}}
+            for b in buckets
+        ]
+        return {
+            "hits": {"total": {"value": 1321}},
+            "aggregations": {
+                "total_income": {"sum": {"value": 84_218_175}},
+                "total_expense": {"sum": {"value": 83_746_035}},
+                "by_category": {
+                    "terms": {
+                        "buckets": es_buckets
+                    }
+                },
+            },
+        }
+
+    @staticmethod
+    def _terms_config(captured):
+        return captured["query"]["aggs"]["by_category"]["aggs"]["terms"]
+
+    @pytest.mark.asyncio
+    async def test_terms_agg_size_is_10(self, mcp, monkeypatch):
+        import financial_mcp.tools.analytics as mod
+        captured = {}
+        async def fake(q):
+            captured["query"] = q
+            return self._summary_with_buckets([])
+        monkeypatch.setattr(mod, "query_elasticsearch", fake)
+        tool = mcp._tool_manager._tools["get_financial_summary"].fn
+        json.loads(await tool())
+        assert self._terms_config(captured)["terms"]["size"] == 10
+
+    @pytest.mark.asyncio
+    async def test_terms_agg_orders_by_total_desc(self, mcp, monkeypatch):
+        import financial_mcp.tools.analytics as mod
+        captured = {}
+        async def fake(q):
+            captured["query"] = q
+            return self._summary_with_buckets([])
+        monkeypatch.setattr(mod, "query_elasticsearch", fake)
+        tool = mcp._tool_manager._tools["get_financial_summary"].fn
+        json.loads(await tool())
+        order = self._terms_config(captured)["terms"]["order"]
+        assert {"total": "desc"} in order
+
+    @pytest.mark.asyncio
+    async def test_terms_agg_uses_key_asc_tie_breaker(self, mcp, monkeypatch):
+        import financial_mcp.tools.analytics as mod
+        captured = {}
+        async def fake(q):
+            captured["query"] = q
+            return self._summary_with_buckets([])
+        monkeypatch.setattr(mod, "query_elasticsearch", fake)
+        tool = mcp._tool_manager._tools["get_financial_summary"].fn
+        json.loads(await tool())
+        order = self._terms_config(captured)["terms"]["order"]
+        assert {"_key": "asc"} in order
+
+    @pytest.mark.asyncio
+    async def test_transfer_exclusion_still_present(self, mcp, monkeypatch):
+        import financial_mcp.tools.analytics as mod
+        captured = {}
+        async def fake(q):
+            captured["query"] = q
+            return self._summary_with_buckets([])
+        monkeypatch.setattr(mod, "query_elasticsearch", fake)
+        json.loads(
+            await mcp._tool_manager._tools["get_financial_summary"].fn()
+        )
+        bc_agg = captured["query"]["aggs"]["by_category"]
+        assert "filter" in bc_agg
+        must_not = bc_agg["filter"]["bool"]["must_not"]
+        assert {"term": {"type": "Transfer"}} in must_not
+
+    @pytest.mark.asyncio
+    async def test_returned_categories_sorted_by_total_desc(self, mcp, monkeypatch):
+        import financial_mcp.tools.analytics as mod
+        # Simulate ES returning buckets already in correct order (total desc)
+        buckets = [
+            {"key": "A", "total": 900},
+            {"key": "B", "total": 500},
+            {"key": "C", "total": 100},
+        ]
+        async def fake(q):
+            return self._summary_with_buckets(buckets)
+        monkeypatch.setattr(mod, "query_elasticsearch", fake)
+        tool = mcp._tool_manager._tools["get_financial_summary"].fn
+        result = json.loads(await tool())
+        cats = result["top_categories"]
+        totals = [c["total"] for c in cats]
+        assert totals == sorted(totals, reverse=True)
+
+    @pytest.mark.asyncio
+    async def test_equal_totals_sorted_by_category_asc(self, mcp, monkeypatch):
+        import financial_mcp.tools.analytics as mod
+        # Simulate ES returning buckets in _key asc order for equal totals
+        # (which is what the _key asc tie-breaker produces)
+        buckets = [
+            {"key": "Apple", "total": 500},
+            {"key": "Banana", "total": 500},
+            {"key": "Cherry", "total": 900},
+        ]
+        async def fake(q):
+            return self._summary_with_buckets(buckets)
+        monkeypatch.setattr(mod, "query_elasticsearch", fake)
+        tool = mcp._tool_manager._tools["get_financial_summary"].fn
+        result = json.loads(await tool())
+        cats = result["top_categories"]
+        assert [c["category"] for c in cats] == ["Cherry", "Apple", "Banana"]
+
+    @pytest.mark.asyncio
+    async def test_at_most_10_categories_returned(self, mcp, monkeypatch):
+        """ES with size=10 returns at most 10 buckets; Python must not
+        expand the list beyond what ES returned."""
+        import financial_mcp.tools.analytics as mod
+        # Simulate ES returning exactly 10 buckets (the max from size=10)
+        buckets = [
+            {"key": f"Cat{i}", "total": (10 - i) * 100} for i in range(10)
+        ]
+        async def fake(q):
+            return self._summary_with_buckets(buckets)
+        monkeypatch.setattr(mod, "query_elasticsearch", fake)
+        tool = mcp._tool_manager._tools["get_financial_summary"].fn
+        result = json.loads(await tool())
+        assert len(result["top_categories"]) == 10
+
+    @pytest.mark.asyncio
+    async def test_income_expense_net_semantics_unchanged(self, mcp, monkeypatch):
+        """total_income, total_expense, net_cash_flow, total_documents
+        must still be computed correctly regardless of bucket content."""
+        import financial_mcp.tools.analytics as mod
+        buckets = [{"key": "Food & Drink", "total": 50_000}]
+        async def fake(q):
+            return self._summary_with_buckets(buckets)
+        monkeypatch.setattr(mod, "query_elasticsearch", fake)
+        tool = mcp._tool_manager._tools["get_financial_summary"].fn
+        result = json.loads(await tool())
+        assert result["total_income"] == 84_218_175
+        assert result["total_expense"] == 83_746_035
+        assert result["net_cash_flow"] == 84_218_175 - 83_746_035
+        assert result["total_documents"] == 1321
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
