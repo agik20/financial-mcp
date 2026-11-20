@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class QueryTransactionParams(BaseModel):
@@ -23,7 +23,10 @@ class QueryTransactionParams(BaseModel):
             (``source_account`` wins when both are supplied).
         aggregation: Group results by ``"daily"``, ``"weekly"``, or
             ``"monthly"``.
-        limit: Maximum number of raw records to return (default 50).
+        limit: Maximum number of raw records to return (default 50,
+            minimum 1, maximum 10000).  Out-of-range values and ``None``
+            are rejected by validation; they never silently fall back to
+            the default.
     """
 
     start_date: Optional[str] = None
@@ -35,13 +38,28 @@ class QueryTransactionParams(BaseModel):
     # clients that were written against the old parameter name.
     source_name: Optional[str] = None
     aggregation: Optional[str] = None
-    limit: Optional[int] = 50
+    limit: int = Field(default=50, ge=1, le=10000)
 
     @model_validator(mode="after")
-    def _fold_source_name(self) -> "QueryTransactionParams":
+    def _fold_and_validate(self) -> "QueryTransactionParams":
+        """Fold ``source_name`` into ``source_account`` and reject inverted date ranges.
+
+        Both checks run at model-construction time, before any Elasticsearch
+        call can occur.  Equal dates, single-endpoint ranges, and
+        fully-omitted ranges are all accepted.
+        """
         if self.source_name and not self.source_account:
             self.source_account = self.source_name
             self.source_name = None
+        if (
+            self.start_date is not None
+            and self.end_date is not None
+            and self.start_date > self.end_date
+        ):
+            raise ValueError(
+                "start_date must not be after end_date "
+                f"(got start_date={self.start_date!r}, end_date={self.end_date!r})"
+            )
         return self
 
     @property

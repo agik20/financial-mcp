@@ -3,8 +3,11 @@
 import json
 import pytest
 
+from pydantic import ValidationError
+
 from financial_mcp.models import QueryTransactionParams
 from financial_mcp.tools.analytics import register_analytics_tools
+from financial_mcp.tools.money import half_even_div
 from mcp.server.fastmcp import FastMCP
 
 
@@ -32,13 +35,11 @@ class TestGetSpendingByCategory:
                                 "key": "Food & Drink",
                                 "total": {"value": 120000},
                                 "tx_count": {"value": 6},
-                                "avg_per_tx": {"value": 20000},
                             },
                             {
                                 "key": "Transport",
                                 "total": {"value": 80000},
                                 "tx_count": {"value": 4},
-                                "avg_per_tx": {"value": 20000},
                             },
                         ]
                     },
@@ -52,12 +53,17 @@ class TestGetSpendingByCategory:
         q = captured["query"]
         assert q["aggs"]["grand_total"]["sum"]["field"] == "amount"
         assert q["aggs"]["by_category"]["aggs"]["total"]["sum"]["field"] == "amount"
+        # F-003: the ES avg sub-agg is no longer requested; avg_per_tx is
+        # computed client-side from total and tx_count.
+        assert "avg_per_tx" not in q["aggs"]["by_category"]["aggs"]
         assert q["query"]["bool"]["must"][0] == {"term": {"type": "Expense"}}
         food = next(c for c in result["categories"] if c["category"] == "Food & Drink")
         assert food["percentage"] == 60.0
         assert food["total"] == 120000
         assert food["tx_count"] == 6
-        assert food["avg_per_tx"] == 20000.0
+        assert food["avg_per_tx"] == 20000
+        transport = next(c for c in result["categories"] if c["category"] == "Transport")
+        assert transport["avg_per_tx"] == 20000
 
     @pytest.mark.asyncio
     async def test_income_uses_signed_amount(self, mcp, monkeypatch):
@@ -72,7 +78,7 @@ class TestGetSpendingByCategory:
                     "by_category": {
                         "buckets": [
                             {"key": "Salary", "total": {"value": 500000},
-                             "tx_count": {"value": 1}, "avg_per_tx": {"value": 500000}},
+                             "tx_count": {"value": 1}},
                         ]
                     },
                 }
@@ -83,6 +89,10 @@ class TestGetSpendingByCategory:
         tool = mcp._tool_manager._tools["get_spending_by_category"].fn
         result = json.loads(await tool(params))
         assert captured["query"]["query"]["bool"]["must"][0] == {"term": {"type": "Income"}}
+        salary = next(c for c in result["categories"] if c["category"] == "Salary")
+        assert salary["total"] == 500000
+        assert salary["tx_count"] == 1
+        assert salary["avg_per_tx"] == 500000
 
     @pytest.mark.asyncio
     async def test_date_filter_uses_transaction_date(self, mcp, monkeypatch):
@@ -597,6 +607,567 @@ class TestTopCategoriesRanking:
         assert result["total_expense"] == 83_746_035
         assert result["net_cash_flow"] == 84_218_175 - 83_746_035
         assert result["total_documents"] == 1321
+
+
+class TestSpendingByCategoryLimitValidation:
+    """F-005: get_spending_by_category shares QueryTransactionParams, so
+    invalid limits are rejected at the model boundary before any ES call."""
+
+    def test_invalid_limit_rejected_by_model_before_any_es_call(self, mcp):
+        """get_spending_by_category shares QueryTransactionParams; since the
+        only construction path is the model, no ES call can ever see limit=-1."""
+        with pytest.raises(ValidationError):
+            QueryTransactionParams(limit=-1)
+
+    @pytest.mark.asyncio
+    async def test_valid_limit_accepted(self, mcp, monkeypatch):
+        import financial_mcp.tools.analytics as mod
+        async def fake(q):
+            return {
+                "aggregations": {
+                    "by_category": {"buckets": []},
+                    "grand_total": {"value": 0},
+                }
+            }
+        monkeypatch.setattr(mod, "query_elasticsearch", fake)
+        tool = mcp._tool_manager._tools["get_spending_by_category"].fn
+        result = json.loads(await tool(QueryTransactionParams(limit=10000)))
+        assert result["grand_total"] == 0
+
+
+# ---------------------------------------------------------------------------
+# F-003: exact integer avg_per_tx (banker's rounding, no float round-trip)
+# ---------------------------------------------------------------------------
+
+class TestAvgPerTxIsInteger:
+    """avg_per_tx must be an exact int computed as half_even_div(total,
+    tx_count), not a rounded float.  The examples below come from the
+    F-003 design spec: 5/2 -> 2, 7/2 -> 4, 8/3 -> 3, 5/3 -> 2."""
+
+    @staticmethod
+    def _spending_response(total, tx_count):
+        return {
+            "aggregations": {
+                "grand_total": {"value": total},
+                "by_category": {
+                    "buckets": [
+                        {"key": "Test", "total": {"value": total},
+                         "tx_count": {"value": tx_count}},
+                    ]
+                },
+            }
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "total,tx_count,expected",
+        [
+            (5, 2, 2),
+            (7, 2, 4),
+            (8, 3, 3),
+            (5, 3, 2),
+        ],
+    )
+    async def test_half_even_examples(self, mcp, monkeypatch, total, tx_count, expected):
+        import financial_mcp.tools.analytics as mod
+
+        async def fake_query(q):
+            return self._spending_response(total, tx_count)
+
+        monkeypatch.setattr(mod, "query_elasticsearch", fake_query)
+        tool = mcp._tool_manager._tools["get_spending_by_category"].fn
+        result = json.loads(await tool(QueryTransactionParams()))
+        category = result["categories"][0]
+        assert category["avg_per_tx"] == expected
+        assert isinstance(category["avg_per_tx"], int)
+
+    @pytest.mark.asyncio
+    async def test_avg_per_tx_zero_when_no_tx(self, mcp, monkeypatch):
+        import financial_mcp.tools.analytics as mod
+
+        async def fake_query(q):
+            return self._spending_response(0, 0)
+
+        monkeypatch.setattr(mod, "query_elasticsearch", fake_query)
+        tool = mcp._tool_manager._tools["get_spending_by_category"].fn
+        result = json.loads(await tool(QueryTransactionParams()))
+        assert result["categories"][0]["avg_per_tx"] == 0
+
+    def test_matches_module_function(self):
+        assert half_even_div(5, 2) == 2
+        assert half_even_div(7, 2) == 4
+        assert half_even_div(8, 3) == 3
+        assert half_even_div(5, 3) == 2
+
+
+# ---------------------------------------------------------------------------
+# F-003: fail-closed monetary coercion error envelopes
+# ---------------------------------------------------------------------------
+
+class TestMonetaryCoercionErrorEnvelopes:
+    """Out-of-contract monetary values are rejected without partial results;
+    the error envelope names the field but never the raw value."""
+
+    @staticmethod
+    def _summary_with_bad_value(value):
+        return {
+            "hits": {"total": {"value": 3}},
+            "aggregations": {
+                "total_income": {"sum": {"value": value}},
+                "total_expense": {"sum": {"value": 0}},
+                "by_category": {"terms": {"buckets": []}},
+            },
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "bad_value",
+        [float("nan"), float("inf"), 1.5, float(2 ** 53 + 1), True],
+    )
+    async def test_get_financial_summary_rejects_bad_total_income(
+        self, mcp, monkeypatch, bad_value
+    ):
+        import financial_mcp.tools.analytics as mod
+
+        async def fake_query(q):
+            return self._summary_with_bad_value(bad_value)
+
+        monkeypatch.setattr(mod, "query_elasticsearch", fake_query)
+        tool = mcp._tool_manager._tools["get_financial_summary"].fn
+        result = json.loads(await tool())
+        assert result["error"] == "monetary value failed validation: total_income"
+        assert "total_documents" not in result
+        assert "top_categories" not in result
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_value", [-1, -42, 1.5, float("nan"), True, False])
+    async def test_get_spending_by_category_rejects_bad_tx_count(
+        self, mcp, monkeypatch, bad_value
+    ):
+        import financial_mcp.tools.analytics as mod
+
+        async def fake_query(q):
+            return {
+                "aggregations": {
+                    "grand_total": {"value": 0},
+                    "by_category": {
+                        "buckets": [
+                            {
+                                "key": "Food",
+                                "total": {"value": 0},
+                                "tx_count": {"value": bad_value},
+                            }
+                        ]
+                    },
+                }
+            }
+
+        monkeypatch.setattr(mod, "query_elasticsearch", fake_query)
+        tool = mcp._tool_manager._tools["get_spending_by_category"].fn
+        result = json.loads(await tool(QueryTransactionParams()))
+        assert result["error"] == "monetary value failed validation: categories.tx_count"
+        assert "categories" not in result
+        assert "grand_total" not in result
+        assert "type" not in result
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_bool", [True, False])
+    async def test_bool_tx_count_rejected_get_spending_by_category(
+        self, mcp, monkeypatch, bad_bool
+    ):
+        """Explicit bool regression: bool is a subclass of int, so a naive
+        ``int()`` / ``isinstance(v, int)`` check would silently accept
+        ``True`` as 1 and ``False`` as 0.  Both must be rejected."""
+        import financial_mcp.tools.analytics as mod
+
+        async def fake_query(q):
+            return {
+                "aggregations": {
+                    "grand_total": {"value": 0},
+                    "by_category": {
+                        "buckets": [
+                            {
+                                "key": "Food",
+                                "total": {"value": 0},
+                                "tx_count": {"value": bad_bool},
+                            }
+                        ]
+                    },
+                }
+            }
+
+        monkeypatch.setattr(mod, "query_elasticsearch", fake_query)
+        tool = mcp._tool_manager._tools["get_spending_by_category"].fn
+        result = json.loads(await tool(QueryTransactionParams()))
+        assert result == {"error": "monetary value failed validation: categories.tx_count"}
+        assert set(result.keys()) == {"error"}
+        assert "categories" not in result
+        assert "grand_total" not in result
+
+    @pytest.mark.asyncio
+    async def test_no_partial_output_across_buckets(self, mcp, monkeypatch):
+        """First bucket is valid; a later bucket has an invalid tx_count.
+        The whole call fails closed — no partial ``categories`` list, no
+        ``grand_total``, only the validation error envelope."""
+        import financial_mcp.tools.analytics as mod
+
+        async def fake_query(q):
+            return {
+                "aggregations": {
+                    "grand_total": {"value": 300000},
+                    "by_category": {
+                        "buckets": [
+                            {
+                                "key": "Food & Drink",
+                                "total": {"value": 200000},
+                                "tx_count": {"value": 4},
+                            },
+                            {
+                                "key": "Transport",
+                                "total": {"value": 100000},
+                                "tx_count": {"value": -3},
+                            },
+                        ]
+                    },
+                }
+            }
+
+        monkeypatch.setattr(mod, "query_elasticsearch", fake_query)
+        tool = mcp._tool_manager._tools["get_spending_by_category"].fn
+        result = json.loads(await tool(QueryTransactionParams()))
+        assert result == {"error": "monetary value failed validation: categories.tx_count"}
+        assert "categories" not in result
+        assert "grand_total" not in result
+        assert "type" not in result
+
+    @pytest.mark.asyncio
+    async def test_get_spending_by_category_rejects_bad_grand_total(
+        self, mcp, monkeypatch
+    ):
+        import financial_mcp.tools.analytics as mod
+
+        async def fake_query(q):
+            return {
+                "aggregations": {
+                    "grand_total": {"value": float("nan")},
+                    "by_category": {"buckets": []},
+                }
+            }
+
+        monkeypatch.setattr(mod, "query_elasticsearch", fake_query)
+        tool = mcp._tool_manager._tools["get_spending_by_category"].fn
+        result = json.loads(await tool(QueryTransactionParams()))
+        assert result["error"] == "monetary value failed validation: grand_total"
+        assert "categories" not in result
+
+    @pytest.mark.asyncio
+    async def test_error_envelope_does_not_leak_value(self, mcp, monkeypatch):
+        import financial_mcp.tools.analytics as mod
+
+        async def fake_query(q):
+            return self._summary_with_bad_value(999_999.5)
+
+        monkeypatch.setattr(mod, "query_elasticsearch", fake_query)
+        tool = mcp._tool_manager._tools["get_financial_summary"].fn
+        result = json.loads(await tool())
+        assert "999999" not in result["error"]
+        assert "999_999" not in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# F-007: caller-level error response tests (analytics tools)
+# ---------------------------------------------------------------------------
+
+from financial_mcp.es_client import ElasticsearchQueryError, es_error_payload
+
+_F007_ANALYTICS_REASONS = ("es_connection", "es_auth", "es_validation")
+
+
+class TestF007AnalyticsCallerLevel:
+    """Verify that analytics MCP tools translate ElasticsearchQueryError
+    into a sanitized JSON error payload."""
+
+    def _make_fail(self, reason):
+        async def _fail(q):
+            raise ElasticsearchQueryError(
+                es_error_payload(reason)["error"], reason=reason
+            )
+        return _fail
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("reason", _F007_ANALYTICS_REASONS)
+    async def test_get_spending_by_category_returns_sanitized_error(self, mcp, monkeypatch, reason):
+        import financial_mcp.tools.analytics as mod
+        monkeypatch.setattr(mod, "query_elasticsearch", self._make_fail(reason))
+        tool = mcp._tool_manager._tools["get_spending_by_category"].fn
+        params = QueryTransactionParams(start_date="2026-01-01", end_date="2026-01-31")
+        result = json.loads(await tool(params))
+        assert "error" in result
+        assert result["reason"] == reason
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("reason", _F007_ANALYTICS_REASONS)
+    async def test_get_financial_summary_returns_sanitized_error(self, mcp, monkeypatch, reason):
+        import financial_mcp.tools.analytics as mod
+        monkeypatch.setattr(mod, "query_elasticsearch", self._make_fail(reason))
+        tool = mcp._tool_manager._tools["get_financial_summary"].fn
+        result = json.loads(await tool())
+        assert "error" in result
+        assert result["reason"] == reason
+
+
+# ---------------------------------------------------------------------------
+# F-003: total_documents is NOT subject to monetary validation
+# ---------------------------------------------------------------------------
+
+class TestTotalDocumentsNotCoerced:
+    """total_documents is a raw count read directly from ``hits.total.value``.
+    It must never be passed through ``coerce_monetary`` (which has a 2**53
+    float guard that is inappropriate for document counts).  These tests
+    prove:
+      1. ``coerce_monetary`` is NOT called for ``total_documents``
+      2. A large integer (e.g. 2**53 + 1) is preserved verbatim
+      3. Monetary fields in the same response still go through validation
+    """
+
+    @staticmethod
+    def _summary_with_docs_total(docs_total, total_income=0, total_expense=0):
+        return {
+            "hits": {"total": {"value": docs_total}},
+            "aggregations": {
+                "total_income": {"sum": {"value": total_income}},
+                "total_expense": {"sum": {"value": total_expense}},
+                "by_category": {"terms": {"buckets": []}},
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_coerce_monetary_not_called_for_total_documents(
+        self, mcp, monkeypatch
+    ):
+        """Monkeypatch ``coerce_monetary`` to raise if invoked with a value
+        matching ``total_documents``.  Also confirm via call log that it was
+        never called with the docs_total value."""
+        import financial_mcp.tools.analytics as mod
+        from financial_mcp.tools.money import coerce_monetary
+
+        big = 2 ** 53 + 1
+        calls: list = []
+
+        def tracking_coerce(value, field):
+            calls.append((field, value))
+            if value == big:
+                raise AssertionError(
+                    f"coerce_monetary was called with total_documents value {big!r} "
+                    f"(field={field!r}); total_documents must not be monetarily coerced"
+                )
+            return coerce_monetary(value, field)
+
+        monkeypatch.setattr(mod, "coerce_monetary", tracking_coerce)
+
+        async def fake_query(q):
+            return self._summary_with_docs_total(
+                docs_total=big, total_income=100, total_expense=50
+            )
+
+        monkeypatch.setattr(mod, "query_elasticsearch", fake_query)
+        tool = mcp._tool_manager._tools["get_financial_summary"].fn
+        result = json.loads(await tool())
+
+        # total_documents must appear unchanged in the output
+        assert result["total_documents"] == big
+        # No call to coerce_monetary may have received the total_documents value
+        for field, value in calls:
+            assert value != big, f"coerce_monetary called on total_documents: {calls}"
+
+    @pytest.mark.asyncio
+    async def test_large_total_documents_preserved_verbatim(
+        self, mcp, monkeypatch
+    ):
+        """A total_documents value above 2**53 is an int (ES long), not a
+        float.  It must pass through unchanged without any monetary guard."""
+        import financial_mcp.tools.analytics as mod
+
+        big = 2 ** 53 + 1
+        assert isinstance(big, int)
+        # Confirm it would be rejected by the monetary guard if coerced as float
+        from financial_mcp.tools.money import coerce_monetary
+        import pytest as _pytest
+        with _pytest.raises(Exception):
+            coerce_monetary(float(big), "check")
+
+        async def fake_query(q):
+            return self._summary_with_docs_total(
+                docs_total=big, total_income=0, total_expense=0
+            )
+
+        monkeypatch.setattr(mod, "query_elasticsearch", fake_query)
+        tool = mcp._tool_manager._tools["get_financial_summary"].fn
+        result = json.loads(await tool())
+        assert result["total_documents"] == big
+        assert isinstance(result["total_documents"], int)
+        # Monetary fields still valid in the same response
+        assert result["total_income"] == 0
+        assert result["total_expense"] == 0
+
+    @pytest.mark.asyncio
+    async def test_monetary_fields_still_validated_alongside_total_documents(
+        self, mcp, monkeypatch
+    ):
+        """Even when total_documents is a large int, a bad monetary value in
+        the same response must still trigger the fail-closed error envelope."""
+        import financial_mcp.tools.analytics as mod
+
+        big_docs = 2 ** 53 + 1
+
+        async def fake_query(q):
+            return {
+                "hits": {"total": {"value": big_docs}},
+                "aggregations": {
+                    "total_income": {"sum": {"value": float("nan")}},
+                    "total_expense": {"sum": {"value": 0}},
+                    "by_category": {"terms": {"buckets": []}},
+                },
+            }
+
+        monkeypatch.setattr(mod, "query_elasticsearch", fake_query)
+        tool = mcp._tool_manager._tools["get_financial_summary"].fn
+        result = json.loads(await tool())
+        assert result["error"] == "monetary value failed validation: total_income"
+        assert "total_documents" not in result
+
+
+# ---------------------------------------------------------------------------
+# F-007: caller-level error response tests (analytics)
+# ---------------------------------------------------------------------------
+
+from financial_mcp.es_client import ElasticsearchQueryError, es_error_payload
+
+
+def _make_es_error(reason: str) -> ElasticsearchQueryError:
+    """Build a real ElasticsearchQueryError with the static message."""
+    return ElasticsearchQueryError(
+        es_error_payload(reason)["error"], reason=reason
+    )
+
+
+class TestGetSpendingByCategoryEsErrors:
+    """F-007: get_spending_by_category returns a sanitized error envelope."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("reason", ["es_connection", "es_auth", "es_validation"])
+    async def test_returns_sanitized_error(self, mcp, monkeypatch, reason):
+        import financial_mcp.tools.analytics as mod
+
+        async def fail(q):
+            raise _make_es_error(reason)
+
+        monkeypatch.setattr(mod, "query_elasticsearch", fail)
+        tool = mcp._tool_manager._tools["get_spending_by_category"].fn
+        result = json.loads(await tool(QueryTransactionParams()))
+        assert result == es_error_payload(reason)
+        assert "grand_total" not in result
+        assert "categories" not in result
+
+    @pytest.mark.asyncio
+    async def test_error_is_not_successful_empty(self, mcp, monkeypatch):
+        """es_connection must not be silently treated as an empty result set."""
+        import financial_mcp.tools.analytics as mod
+
+        async def fail(q):
+            raise _make_es_error("es_connection")
+
+        monkeypatch.setattr(mod, "query_elasticsearch", fail)
+        tool = mcp._tool_manager._tools["get_spending_by_category"].fn
+        result = json.loads(await tool(QueryTransactionParams()))
+        assert "grand_total" not in result
+        assert "categories" not in result
+        assert "error" in result
+
+
+class TestGetFinancialSummaryEsErrors:
+    """F-007: get_financial_summary returns a sanitized error envelope."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("reason", ["es_timeout", "es_not_found", "es_dependency"])
+    async def test_returns_sanitized_error(self, mcp, monkeypatch, reason):
+        import financial_mcp.tools.analytics as mod
+
+        async def fail(q):
+            raise _make_es_error(reason)
+
+        monkeypatch.setattr(mod, "query_elasticsearch", fail)
+        tool = mcp._tool_manager._tools["get_financial_summary"].fn
+        result = json.loads(await tool())
+        assert result == es_error_payload(reason)
+        assert "total_income" not in result
+        assert "total_documents" not in result
+
+    @pytest.mark.asyncio
+    async def test_error_is_not_successful_empty(self, mcp, monkeypatch):
+        """es_connection must not be silently treated as an empty result set."""
+        import financial_mcp.tools.analytics as mod
+
+        async def fail(q):
+            raise _make_es_error("es_connection")
+
+        monkeypatch.setattr(mod, "query_elasticsearch", fail)
+        tool = mcp._tool_manager._tools["get_financial_summary"].fn
+        result = json.loads(await tool())
+        assert "total_income" not in result
+        assert "total_documents" not in result
+        assert "error" in result
+
+
+class TestEsQueryErrorCallerContract:
+    """F-007: analytics tools must translate ElasticsearchQueryError
+    into the sanitized JSON error envelope."""
+
+    @pytest.mark.asyncio
+    async def test_get_spending_by_category_returns_sanitized_error(
+        self, mcp, monkeypatch
+    ):
+        import financial_mcp.tools.analytics as mod
+        from financial_mcp.es_client import (
+            ElasticsearchQueryError,
+            es_error_payload,
+        )
+
+        async def fail(q):
+            raise ElasticsearchQueryError(
+                es_error_payload("es_connection")["error"],
+                reason="es_connection",
+            )
+        monkeypatch.setattr(mod, "query_elasticsearch", fail)
+        tool = mcp._tool_manager._tools["get_spending_by_category"].fn
+        result = json.loads(await tool(QueryTransactionParams()))
+        assert result["reason"] == "es_connection"
+        assert result["error"] == "Elasticsearch connection unavailable"
+        assert "grand_total" not in result
+        assert "categories" not in result
+
+    @pytest.mark.asyncio
+    async def test_get_financial_summary_returns_sanitized_error(
+        self, mcp, monkeypatch
+    ):
+        import financial_mcp.tools.analytics as mod
+        from financial_mcp.es_client import (
+            ElasticsearchQueryError,
+            es_error_payload,
+        )
+
+        async def fail(q):
+            raise ElasticsearchQueryError(
+                es_error_payload("es_auth")["error"],
+                reason="es_auth",
+            )
+        monkeypatch.setattr(mod, "query_elasticsearch", fail)
+        tool = mcp._tool_manager._tools["get_financial_summary"].fn
+        result = json.loads(await tool())
+        assert result["reason"] == "es_auth"
+        assert result["error"] == "Elasticsearch authentication or authorization failed"
+        assert "total_income" not in result
+        assert "net_cash_flow" not in result
 
 
 if __name__ == "__main__":

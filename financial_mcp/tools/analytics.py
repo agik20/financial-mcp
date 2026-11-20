@@ -20,8 +20,24 @@ from typing import Any, Dict
 
 from mcp.server.fastmcp import FastMCP
 
-from financial_mcp.es_client import query_elasticsearch
+from financial_mcp.es_client import (
+    ElasticsearchQueryError,
+    es_error_payload,
+    query_elasticsearch,
+)
 from financial_mcp.models import QueryTransactionParams
+from financial_mcp.tools.money import (
+    MonetaryCoercionError,
+    coerce_count,
+    coerce_monetary,
+    half_even_div,
+    monetary_error,
+)
+
+
+def _monetary_tool_error(field: str) -> str:
+    """Build the tool-level JSON error envelope for a monetary validation failure."""
+    return json.dumps(monetary_error(field), indent=2, ensure_ascii=False)
 
 
 def register_analytics_tools(mcp: FastMCP) -> None:
@@ -89,50 +105,70 @@ def register_analytics_tools(mcp: FastMCP) -> None:
                     "aggs": {
                         "total": {"sum": {"field": "amount"}},
                         "tx_count": {"value_count": {"field": "amount"}},
-                        "avg_per_tx": {"avg": {"field": "amount"}},
                     },
                 },
                 "grand_total": {"sum": {"field": "amount"}},
             },
         }
 
-        data = await query_elasticsearch(es_query)
-        if not data:
+        try:
+            data = await query_elasticsearch(es_query)
+        except ElasticsearchQueryError as e:
+            return json.dumps(es_error_payload(e.reason), indent=2)
+
+        try:
+            # F-003: fail-closed coercion.  ES returns sum/value_count as
+            # float64, which silently loses precision above 2**53 - 1; a bad
+            # value is rejected instead of emitted as a plausible-but-wrong
+            # integer.
+            grand_total = coerce_monetary(
+                data["aggregations"]["grand_total"]["value"], "grand_total"
+            )
+            buckets = data["aggregations"]["by_category"]["buckets"]
+
+            result: list[Dict[str, Any]] = []
+            for b in buckets:
+                total = coerce_monetary(b["total"]["value"], "categories.total")
+                # F-003: count uses dedicated validator — count semantics are
+                # exact non-negative integers, not subject to the monetary
+                # 2**53 precision guard.
+                tx_count = coerce_count(
+                    b["tx_count"]["value"], "categories.tx_count"
+                )
+                # Compute avg_per_tx client-side with exact integer
+                # half-to-even division instead of the ES float avg sub-agg.
+                avg_per_tx = (
+                    half_even_div(total, tx_count) if tx_count > 0 else 0
+                )
+                result.append(
+                    {
+                        "category": b["key"],
+                        "total": total,
+                        "percentage": (
+                            round((total / grand_total * 100), 1)
+                            if grand_total
+                            else 0
+                        ),
+                        "tx_count": tx_count,
+                        "avg_per_tx": avg_per_tx,
+                    }
+                )
+
+            result.sort(key=lambda x: x["total"], reverse=True)
+
             return json.dumps(
-                {"error": "Unable to query Elasticsearch"}, indent=2
-            )
-
-        grand_total = data["aggregations"]["grand_total"]["value"]
-        buckets = data["aggregations"]["by_category"]["buckets"]
-
-        result: list[Dict[str, Any]] = []
-        for b in buckets:
-            total = b["total"]["value"]
-            result.append(
                 {
-                    "category": b["key"],
-                    "total": total,
-                    "percentage": (
-                        round((total / grand_total * 100), 1)
-                        if grand_total
-                        else 0
-                    ),
-                    "tx_count": int(b["tx_count"]["value"]),
-                    "avg_per_tx": round(b["avg_per_tx"]["value"], 0),
-                }
+                    "type": tx_type,
+                    "grand_total": grand_total,
+                    "categories": result,
+                },
+                indent=2,
+                ensure_ascii=False,
             )
-
-        result.sort(key=lambda x: x["total"], reverse=True)
-
-        return json.dumps(
-            {
-                "type": tx_type,
-                "grand_total": grand_total,
-                "categories": result,
-            },
-            indent=2,
-            ensure_ascii=False,
-        )
+        except MonetaryCoercionError as e:
+            return json.dumps(
+                monetary_error(e.field), indent=2, ensure_ascii=False
+            )
 
     @mcp.tool()
     async def get_financial_summary() -> str:
@@ -201,32 +237,52 @@ def register_analytics_tools(mcp: FastMCP) -> None:
             },
         }
 
-        data = await query_elasticsearch(es_query)
-        if not data:
-            return json.dumps(
-                {"error": "Unable to query Elasticsearch"}, indent=2
+        try:
+            data = await query_elasticsearch(es_query)
+        except ElasticsearchQueryError as e:
+            return json.dumps(es_error_payload(e.reason), indent=2)
+
+        try:
+            # F-003: fail-closed coercion.  ES returns sum/value_count as
+            # float64, which silently loses precision above 2**53 - 1; a bad
+            # value is rejected instead of emitted as a plausible-but-wrong
+            # integer.
+            aggs = data["aggregations"]
+            total_income = coerce_monetary(
+                aggs["total_income"]["sum"]["value"], "total_income"
             )
+            total_expense = coerce_monetary(
+                aggs["total_expense"]["sum"]["value"], "total_expense"
+            )
+            net_cash_flow = total_income - total_expense
 
-        aggs = data["aggregations"]
-        total_income = aggs["total_income"]["sum"]["value"]
-        total_expense = aggs["total_expense"]["sum"]["value"]
-        net_cash_flow = total_income - total_expense
+            by_cat_terms = aggs["by_category"]["terms"]
+            top_categories = []
+            for b in by_cat_terms["buckets"]:
+                cat_total = coerce_monetary(
+                    b["total"]["value"], "top_categories.total"
+                )
+                top_categories.append(
+                    {"category": b["key"], "total": cat_total}
+                )
+            top_categories.sort(key=lambda c: (-c["total"], c["category"]))
 
-        by_cat_terms = aggs["by_category"]["terms"]
-        top_categories = [
-            {"category": b["key"], "total": b["total"]["value"]}
-            for b in by_cat_terms["buckets"]
-        ]
-        top_categories.sort(key=lambda c: (-c["total"], c["category"]))
+            # total_documents is a non-monetary count; preserved as-is from
+            # ES without monetary coercion (F-003 correction).
+            total_documents = data["hits"]["total"]["value"]
 
-        return json.dumps(
-            {
-                "total_income": total_income,
-                "total_expense": total_expense,
-                "net_cash_flow": net_cash_flow,
-                "top_categories": top_categories,
-                "total_documents": data["hits"]["total"]["value"],
-            },
-            indent=2,
-            ensure_ascii=False,
-        )
+            return json.dumps(
+                {
+                    "total_income": total_income,
+                    "total_expense": total_expense,
+                    "net_cash_flow": net_cash_flow,
+                    "top_categories": top_categories,
+                    "total_documents": total_documents,
+                },
+                indent=2,
+                ensure_ascii=False,
+            )
+        except MonetaryCoercionError as e:
+            return json.dumps(
+                monetary_error(e.field), indent=2, ensure_ascii=False
+            )
