@@ -6,6 +6,9 @@ over stdio when executed directly::
     python -m financial_mcp.server
 """
 
+import calendar
+import re
+
 from mcp.server.fastmcp import FastMCP
 
 from financial_mcp.tools.analytics import register_analytics_tools
@@ -22,6 +25,9 @@ register_analytics_tools(mcp)
 # ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
+_MONTH_RE = re.compile(r"^[0-9]{4}-(0[1-9]|1[0-2])$")
+
+
 @mcp.prompt()
 def monthly_report(month: str = "") -> str:
     """Generate a monthly financial report.
@@ -33,10 +39,19 @@ def monthly_report(month: str = "") -> str:
     Returns:
         A prompt string instructing the LLM to call the appropriate
         MCP tools.
+
+    Raises:
+        ValueError: when *month* is not empty and not a valid
+            ``YYYY-MM`` month.
     """
     if month:
+        if not _MONTH_RE.fullmatch(month):
+            raise ValueError("month must be in YYYY-MM format")
+        year, mon = int(month[:4]), int(month[5:7])
         start = f"{month}-01"
-        end = f"{month}-31"
+        # Last day of the month, not a hardcoded 31: Feb has 28/29 and
+        # four months have 30 days, so "-31" would query past month-end.
+        end = f"{month}-{calendar.monthrange(year, mon)[1]:02d}"
         return (
             f"Buatkan laporan keuangan bulanan untuk periode {month}. "
             f"Gunakan tool query_transactions dengan start_date='{start}' "
