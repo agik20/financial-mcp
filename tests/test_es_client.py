@@ -1,4 +1,5 @@
 import json
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List
 from unittest import mock
@@ -9,7 +10,11 @@ from elasticsearch import AsyncElasticsearch
 from financial_mcp import es_client
 from financial_mcp.es_client import (
     CATEGORY_MAPPING,
+    ES_REASONS,
     PARENT_CATEGORY_MAP,
+    ElasticsearchQueryError,
+    classify_es_failure,
+    es_error_payload,
     generate_actions,
     generate_doc_id,
     validate_date,
@@ -166,6 +171,8 @@ class TestValidateTransaction:
         with pytest.raises(ValueError, match="non-Transfer transaction must not have"):
             validate_transaction(_valid_doc({
                 "destination_account": "BCA",
+                "amount": 0,
+                "signed_amount": 0,
             }))
 
     def test_income_with_destination_rejected(self):
@@ -175,6 +182,7 @@ class TestValidateTransaction:
                 "category": "Salary",
                 "parent_category": "Financial",
                 "destination_account": "BCA",
+                "amount": 100000,
                 "signed_amount": 100000,
             }))
 
@@ -425,3 +433,253 @@ class TestAsyncEsClient:
                 pass
         options = mock_cls.call_args.kwargs
         assert "api_key" not in options
+
+
+# ---------------------------------------------------------------------------
+# F-007: sanitized Elasticsearch error classification
+# ---------------------------------------------------------------------------
+
+def _api_error(status: int, cls=None):
+    from elasticsearch import ApiError
+
+    meta = mock.MagicMock()
+    meta.status = status
+    return cls(status, meta, {}) if cls is not None else ApiError(status, meta, {})
+
+
+def _transport_error(cause=None):
+    from elasticsearch import TransportError
+
+    if cause is None:
+        return TransportError("transport failure")
+    exc = TransportError(f"transport failure: {cause}")
+    # Mirror ``raise ... from cause`` so __cause__ is set explicitly --
+    # the classifier walks __cause__ before __context__.
+    exc.__cause__ = cause
+    return exc
+
+
+class TestClassifyEsFailure:
+    """The F-007 classifier maps the installed client's exception
+    hierarchy onto the closed-set :data:`ES_REASONS`."""
+
+    def test_auth_exceptions_map_to_es_auth(self):
+        from elasticsearch import AuthenticationException, AuthorizationException
+
+        assert classify_es_failure(_api_error(401, AuthenticationException)) == "es_auth"
+        assert classify_es_failure(_api_error(403, AuthorizationException)) == "es_auth"
+
+    def test_timeout_maps_to_es_timeout(self):
+        from elastic_transport import ConnectionTimeout
+
+        assert classify_es_failure(ConnectionTimeout("timed out")) == "es_timeout"
+
+    def test_404_maps_to_es_not_found(self):
+        from elasticsearch import NotFoundError
+
+        assert classify_es_failure(_api_error(404, NotFoundError)) == "es_not_found"
+        assert classify_es_failure(_api_error(404)) == "es_not_found"
+
+    def test_400_409_map_to_es_validation(self):
+        assert classify_es_failure(_api_error(400)) == "es_validation"
+        assert classify_es_failure(_api_error(409)) == "es_validation"
+
+    def test_other_http_statuses_map_to_es_unknown(self):
+        assert classify_es_failure(_api_error(429)) == "es_unknown"
+        assert classify_es_failure(_api_error(500)) == "es_unknown"
+        assert classify_es_failure(_api_error(503)) == "es_unknown"
+
+    def test_connection_error_maps_to_es_connection(self):
+        from elasticsearch import ConnectionError
+
+        assert classify_es_failure(ConnectionError("conn refused")) == "es_connection"
+
+    def test_import_error_maps_to_es_dependency(self):
+        assert classify_es_failure(ImportError("aiohttp missing")) == "es_dependency"
+        assert classify_es_failure(ModuleNotFoundError("elastic_transport")) == "es_dependency"
+
+    def test_transport_error_maps_to_es_connection(self):
+        assert classify_es_failure(_transport_error()) == "es_connection"
+
+    def test_transport_error_caused_by_timeout_maps_to_es_timeout(self):
+        from elastic_transport import ConnectionTimeout
+
+        exc = _transport_error(ConnectionTimeout("read timeout"))
+        assert classify_es_failure(exc) == "es_timeout"
+
+    def test_unrelated_exception_maps_to_es_unknown(self):
+        assert classify_es_failure(ValueError("boom")) == "es_unknown"
+
+    def test_all_reasons_are_closed_set_members(self):
+        for reason in ES_REASONS:
+            assert reason in ES_REASONS
+
+
+class TestEsErrorPayload:
+    """The error envelope carries only a static message + closed reason --
+    never the underlying exception text, query, endpoint, or credentials."""
+
+    def test_payload_shape_for_every_reason(self):
+        for reason in ES_REASONS:
+            payload = es_error_payload(reason)
+            assert set(payload.keys()) == {"error", "reason"}
+            assert payload["reason"] == reason
+            assert isinstance(payload["error"], str) and payload["error"]
+
+    def test_reasons_are_stable_and_disjoint(self):
+        messages = {es_error_payload(r)["error"] for r in ES_REASONS}
+        assert len(messages) == len(ES_REASONS)
+
+    def test_no_leak_of_exception_detail(self):
+        from elasticsearch import ConnectionError
+
+        exc = ConnectionError(
+            "Connection refused: https://es.internal:9243/fin_v3 "
+            "api_key=sk-test"
+        )
+        payload = es_error_payload(classify_es_failure(exc))
+        text = str(payload)
+        assert "sk-test" not in text
+        assert "es.internal" not in text
+        assert "Connection refused" not in text
+        assert payload["reason"] == "es_connection"
+
+
+class TestQueryElasticsearchContract:
+    """query_elasticsearch raises ElasticsearchQueryError with a sanitized
+    reason; successful zero-hit results still return the response body."""
+
+    @staticmethod
+    def _raise_search_error(side_effect):
+        client = mock.MagicMock()
+        client.search = mock.AsyncMock(side_effect=side_effect)
+        return client
+
+    @pytest.mark.asyncio
+    async def test_successful_empty_result_returns_body(self, monkeypatch):
+        from elasticsearch import NotFoundError  # noqa: F401  (hierarchy check)
+        body = {"hits": {"total": {"value": 0}, "hits": []}}
+        client = mock.MagicMock()
+        resp = mock.MagicMock()
+        resp.body = body
+        client.search = mock.AsyncMock(return_value=resp)
+        with mock.patch.object(
+            es_client, "get_async_es_client",
+            mock.MagicMock(side_effect=lambda: _fake_cm(client)),
+        ):
+            result = await es_client.query_elasticsearch({"size": 50})
+        assert result is body
+
+    @pytest.mark.asyncio
+    async def test_auth_failure_raises_sanitized_error(self, monkeypatch):
+        from elasticsearch import AuthenticationException
+
+        client = self._raise_search_error(_api_error(401, AuthenticationException))
+        monkeypatch.setattr(
+            es_client, "get_async_es_client", _fake_cm_factory(client)
+        )
+        with pytest.raises(ElasticsearchQueryError) as excinfo:
+            await es_client.query_elasticsearch({"size": 50})
+        assert excinfo.value.reason == "es_auth"
+        assert excinfo.value.message == es_error_payload("es_auth")["error"]
+        # No exception text in the sanitized error.
+        assert "denied" not in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    async def test_timeout_raises_sanitized_error(self, monkeypatch):
+        from elastic_transport import ConnectionTimeout
+
+        client = self._raise_search_error(ConnectionTimeout("read timeout"))
+        monkeypatch.setattr(
+            es_client, "get_async_es_client", _fake_cm_factory(client)
+        )
+        with pytest.raises(ElasticsearchQueryError) as excinfo:
+            await es_client.query_elasticsearch({"size": 50})
+        assert excinfo.value.reason == "es_timeout"
+
+    @pytest.mark.asyncio
+    async def test_404_raises_sanitized_error(self, monkeypatch):
+        from elasticsearch import NotFoundError
+
+        client = self._raise_search_error(_api_error(404, NotFoundError))
+        monkeypatch.setattr(
+            es_client, "get_async_es_client", _fake_cm_factory(client)
+        )
+        with pytest.raises(ElasticsearchQueryError) as excinfo:
+            await es_client.query_elasticsearch({"size": 50})
+        assert excinfo.value.reason == "es_not_found"
+
+    @pytest.mark.asyncio
+    async def test_400_raises_sanitized_error(self, monkeypatch):
+        client = self._raise_search_error(_api_error(400))
+        monkeypatch.setattr(
+            es_client, "get_async_es_client", _fake_cm_factory(client)
+        )
+        with pytest.raises(ElasticsearchQueryError) as excinfo:
+            await es_client.query_elasticsearch({"size": 50})
+        assert excinfo.value.reason == "es_validation"
+
+    @pytest.mark.asyncio
+    async def test_500_raises_sanitized_unknown(self, monkeypatch):
+        client = self._raise_search_error(_api_error(500))
+        monkeypatch.setattr(
+            es_client, "get_async_es_client", _fake_cm_factory(client)
+        )
+        with pytest.raises(ElasticsearchQueryError) as excinfo:
+            await es_client.query_elasticsearch({"size": 50})
+        assert excinfo.value.reason == "es_unknown"
+
+    @pytest.mark.asyncio
+    async def test_connection_error_raises_sanitized_error(self, monkeypatch):
+        from elasticsearch import ConnectionError
+
+        client = self._raise_search_error(ConnectionError("reset"))
+        monkeypatch.setattr(
+            es_client, "get_async_es_client", _fake_cm_factory(client)
+        )
+        with pytest.raises(ElasticsearchQueryError) as excinfo:
+            await es_client.query_elasticsearch({"size": 50})
+        assert excinfo.value.reason == "es_connection"
+
+    @pytest.mark.asyncio
+    async def test_import_error_raises_sanitized_dependency(self, monkeypatch):
+        client = self._raise_search_error(ImportError("aiohttp"))
+        monkeypatch.setattr(
+            es_client, "get_async_es_client", _fake_cm_factory(client)
+        )
+        with pytest.raises(ElasticsearchQueryError) as excinfo:
+            await es_client.query_elasticsearch({"size": 50})
+        assert excinfo.value.reason == "es_dependency"
+
+    @pytest.mark.asyncio
+    async def test_error_carries_cause_for_in_process_debugging(self, monkeypatch):
+        from elasticsearch import ConnectionError
+
+        original = ConnectionError("reset")
+        client = self._raise_search_error(original)
+        monkeypatch.setattr(
+            es_client, "get_async_es_client", _fake_cm_factory(client)
+        )
+        with pytest.raises(ElasticsearchQueryError) as excinfo:
+            await es_client.query_elasticsearch({"size": 50})
+        assert excinfo.value.__cause__ is original
+
+
+def _fake_cm_factory(client):
+    """Patch target: a function returning the async CM context factory."""
+    def factory(*args, **kwargs):
+        return _fake_cm(client)
+    return factory
+
+
+def _fake_cm(client):
+    @asynccontextmanager
+    async def cm():
+        yield client
+    return cm()
+
+
+if __name__ == "__main__":
+    import pytest
+
+    pytest.main([__file__, "-v"])
