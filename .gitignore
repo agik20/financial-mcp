@@ -1,4 +1,3 @@
-# Python-generated files
 __pycache__/
 *.py[oc]
 build/
@@ -6,18 +5,15 @@ dist/
 wheels/
 *.egg-info
 
-# Virtual environments
 .venv
 
-# IDE
 .vscode/
 .idea/
 
-# Environment
 .env
 
-# Backup
 backup/
 
-# Data pribadi - JANGAN DI-PUSH
 data/
+
+docs/

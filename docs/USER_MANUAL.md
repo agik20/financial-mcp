@@ -147,7 +147,7 @@ File: `%APPDATA%\Claude\claude_desktop_config.json` (Windows)
 | `source_account` | string                      | Filter akun sumber, misal `"BNI"` |
 | `source_name`    | string *(legacy)*           | Alias lama untuk `source_account`; akan digabung ke `source_account` secara otomatis |
 | `aggregation`    | `daily` / `weekly` / `monthly` | Jika diisi, return time-series; jika kosong return raw records |
-| `limit`          | int (default 50)            | Maks. record saat tanpa aggregation |
+| `limit`          | int (default 50, min 1, max 10000) | Maks. record saat tanpa aggregation; nilai di luar rentang atau `None` ditolak |
 
 ## Prompts Terdaftar
 
@@ -248,7 +248,7 @@ mypy financial_mcp/
 
 ---
 
-*Last updated: 2026-11-18*
+*Last updated: 2026-11-20*
 
 ## Net Cash Flow — Konvensi
 
@@ -265,3 +265,90 @@ posisi cashflow keseluruhan.
 | `Income` | magnitude (≥ 0) | positif atau 0 | Ya (income) |
 | `Expense` | magnitude (≥ 0) | negatif atau 0 | Ya (expense) |
 | `Transfer` | magnitude (> 0) | selalu negatif | Tidak |
+
+## Kontrak Nilai Moneter (F-003)
+
+Semua nilai uang yang dikembalikan oleh MCP server ini adalah **bilangan
+bulat IDR** (`int`), bukan float.
+
+### Mengapa perlu
+
+Elasticsearch mengembalikan hasil agregasi (`sum`, `value_count`) sebagai
+IEEE-754 `float64`. Untuk magnitude di atas `2^53 − 1`
+(9.007.199.254.740.991), float64 tidak lagi bisa membedakan bilangan
+bertetangga — nilainya jadi salah tanpa error apa pun.
+
+### Lapisan koersi (`financial_mcp/tools/money.py`)
+
+Setiap nilai moneter divalidasi **fail-closed** sebelum dikirim:
+
+| Diterima | Ditolak |
+|---|---|
+| `int` (angka presisi penuh) | `bool` (`True`/`False`) |
+| float integral dengan `abs ≤ 2^53 − 1` | float pecahan (`1.5`, `0.0001`) |
+| | `NaN`, `inf`, `-inf` |
+| | float dengan `abs > 2^53 − 1` |
+| | `None`, `str`, `bytes`, `Decimal`, tipe lain |
+
+Nilai yang ditolak **tidak** menghasilkan hasil parsial dan tidak
+pernah masuk ke pesan error atau log.
+
+### Rata-rata per transaksi (`avg_per_tx`)
+
+`avg_per_tx` dihitung di sisi server, bukan di Elasticsearch:
+
+```
+avg_per_tx = total // tx_count        # jika total % tx_count != 0
+avg_per_tx = total / tx_count         # jika habis dibagi
+```
+
+Pembulatan tie (sisanya tepat setengah) memakai aturan **half-to-even**
+(banker's rounding): `5/2 → 2`, `7/2 → 4`, `1/2 → 0`, `3/2 → 2`.
+Jika `tx_count == 0`, `avg_per_tx` bernilai `0`.
+
+Seluruh aritmetika memakai integer — tidak ada round-trip float, jadi
+hasilnya selalu eksak.
+
+### Pesan error
+
+Jika suatu nilai tidak lolos koersi, tool mengembalikan:
+
+```json
+{ "error": "monetary value failed validation: total_income" }
+```
+
+Hanya nama field yang disebut; nilai yang ditolak tidak pernah
+ditampilkan. Field yang bisa muncul di pesan ini:
+`total_income`, `total_expense`, `grand_total`, `top_categories.total`,
+`categories.total`, `tx_count`, `categories.tx_count`.
+
+### `tx_count` di time-series
+
+Pada `query_transactions` dengan `aggregation`, `tx_count` kini
+dijamin `int` (sebelumnya bisa muncul sebagai float64 dari ES).
+
+### Kontrak Count (`coerce_count`) — terpisah dari kontrak moneter (Fix #3)
+
+Nilai hitungan (sekarang hanya `tx_count` dan `categories.tx_count`)
+divalidasi dengan validator khusus `coerce_count`, **bukan**
+`coerce_monetary`. Alasannya: `value_count` Elasticsearch selalu
+mengembalikan `long`, dan jumlah transaksi tidak terikat batas
+presisi float64 — count bisa sah jauh di atas 2^53 tanpa
+kekhawatiran presisi.
+
+| Diterima | Ditolak |
+|---|---|
+| `int` ≥ 0 (berapapun besarnya) | `int` negatif |
+| float integral ≥ 0, finit | `bool` (`True`/`False`) |
+| | float pecahan |
+| | `NaN`, `inf`, `-inf` |
+| | `None`, `str`, `bytes`, `Decimal`, tipe lain |
+
+Jadi: `coerce_count(2**53 + 1)` diterima; `coerce_monetary(2**53 + 1)`
+sebagai float **ditolak**. Ini sengaja — dua semantik, dua validator.
+
+### `total_documents` di `get_financial_summary`
+
+`total_documents` berasal dari `hits.total.value` — hitungan, bukan
+nilai moneter. Ia **tidak** melewati lapisan koersi apa pun;
+disimpan apa adanya dari respons ES. Ini bukan konvensi moneter.
