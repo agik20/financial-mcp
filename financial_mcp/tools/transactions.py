@@ -5,8 +5,18 @@ from typing import Any, Dict, Optional, Tuple
 
 from mcp.server.fastmcp import FastMCP
 
-from financial_mcp.es_client import query_elasticsearch
+from financial_mcp.es_client import (
+    ElasticsearchQueryError,
+    es_error_payload,
+    query_elasticsearch,
+)
 from financial_mcp.models import QueryTransactionParams
+from financial_mcp.tools.money import (
+    MonetaryCoercionError,
+    coerce_count,
+    coerce_monetary,
+    monetary_error,
+)
 
 
 def _parse_es_total(hits_total: Any) -> Tuple[int, str]:
@@ -76,11 +86,10 @@ def register_transaction_tools(mcp: FastMCP) -> None:
             "query": {"match_all": {}},
             "track_total_hits": True,
         }
-        data = await query_elasticsearch(query)
-        if not data:
-            return json.dumps(
-                {"error": "Unable to query Elasticsearch"}, indent=2
-            )
+        try:
+            data = await query_elasticsearch(query)
+        except ElasticsearchQueryError as e:
+            return json.dumps(es_error_payload(e.reason), indent=2)
 
         hits = data["hits"]["hits"]
         records = [h["_source"] for h in hits]
@@ -122,6 +131,10 @@ def register_transaction_tools(mcp: FastMCP) -> None:
           Transfer transactions are **excluded** from the net figure;
           they represent money moving between the owner's own accounts
           and must not count as gains or losses.
+
+        ``params.limit`` bounds raw-record pagination (default 50,
+        minimum 1, maximum 10000).  Out-of-range values and ``None``
+        are rejected by validation and never fall back to the default.
 
         Args:
             params: Filter / aggregation parameters (see
@@ -165,7 +178,7 @@ def register_transaction_tools(mcp: FastMCP) -> None:
                 if must_clauses
                 else {"match_all": {}}
             ),
-            "size": 0 if params.aggregation else (params.limit or 50),
+            "size": 0 if params.aggregation else params.limit,
             "sort": (
                 []
                 if params.aggregation
@@ -212,48 +225,61 @@ def register_transaction_tools(mcp: FastMCP) -> None:
                 }
             }
 
-            data = await query_elasticsearch(es_query)
-            if not data:
+            try:
+                data = await query_elasticsearch(es_query)
+            except ElasticsearchQueryError as e:
+                return json.dumps(es_error_payload(e.reason), indent=2)
+
+            try:
+                buckets = (
+                    data.get("aggregations", {})
+                    .get("time_series", {})
+                    .get("buckets", [])
+                )
+                result: list[Dict[str, Any]] = []
+                for b in buckets:
+                    # F-003: fail-closed coercion.  ES returns sum/value_count
+                    # results as float64; reject values that cannot be
+                    # represented as exact whole-IDR integers above 2**53 - 1.
+                    te = coerce_monetary(
+                        b["total_expense"]["sum"]["value"], "total_expense"
+                    )
+                    ti = coerce_monetary(
+                        b["total_income"]["sum"]["value"], "total_income"
+                    )
+                    # tx_count uses the dedicated count validator: exact
+                    # non-negative integer, no monetary precision guard.
+                    tx_count = coerce_count(b["tx_count"]["value"], "tx_count")
+                    result.append(
+                        {
+                            "period": b["key_as_string"],
+                            "total_expense": te,
+                            "total_income": ti,
+                            "net": ti - te,
+                            "tx_count": tx_count,
+                        }
+                    )
+
                 return json.dumps(
-                    {"error": "Unable to query Elasticsearch"}, indent=2
-                )
-
-            buckets = (
-                data.get("aggregations", {})
-                .get("time_series", {})
-                .get("buckets", [])
-            )
-            result: list[Dict[str, Any]] = []
-            for b in buckets:
-                te = b["total_expense"]["sum"]["value"]
-                ti = b["total_income"]["sum"]["value"]
-                result.append(
                     {
-                        "period": b["key_as_string"],
-                        "total_expense": te,
-                        "total_income": ti,
-                        "net": ti - te,
-                        "tx_count": int(b["tx_count"]["value"]),
-                    }
+                        "aggregation": params.aggregation,
+                        "total_periods": len(result),
+                        "data": result,
+                    },
+                    indent=2,
+                    ensure_ascii=False,
                 )
-
-            return json.dumps(
-                {
-                    "aggregation": params.aggregation,
-                    "total_periods": len(result),
-                    "data": result,
-                },
-                indent=2,
-                ensure_ascii=False,
-            )
+            except MonetaryCoercionError as e:
+                return json.dumps(
+                    monetary_error(e.field), indent=2, ensure_ascii=False
+                )
 
         # No aggregation -- return raw records
         es_query["track_total_hits"] = True
-        data = await query_elasticsearch(es_query)
-        if not data:
-            return json.dumps(
-                {"error": "Unable to query Elasticsearch"}, indent=2
-            )
+        try:
+            data = await query_elasticsearch(es_query)
+        except ElasticsearchQueryError as e:
+            return json.dumps(es_error_payload(e.reason), indent=2)
 
         hits = data["hits"]["hits"]
         records = [h["_source"] for h in hits]
