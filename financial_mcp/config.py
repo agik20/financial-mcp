@@ -58,7 +58,7 @@ _PACKAGE_DIR: str = os.path.dirname(__file__)
 _DATA_DIR: str = os.path.normpath(os.path.join(_PACKAGE_DIR, "..", "data"))
 
 DATA_FILE_PATH: str = os.path.join(
-    _DATA_DIR, "Financ  - Transactions.json",
+    _DATA_DIR, "Financ - Transactions.json",
 )
 DATA_CSV_PATH: str = os.path.join(
     _DATA_DIR, "Financ - Transactions.csv",
