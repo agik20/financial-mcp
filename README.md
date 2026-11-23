@@ -34,7 +34,7 @@ The project currently uses a single sample financial transaction dataset and a l
 - Expose financial operations through MCP tools
 - Provide MCP prompts for common financial analysis workflows
 - Run entirely against a local Elasticsearch instance
-- 98 automated tests with full coverage of ingestion, query, and validation logic
+- 517 automated tests covering ingestion, query, and validation logic
 
 ## Architecture
 
@@ -147,7 +147,7 @@ Natural-language response
 | MCP Transport | stdio |
 | LLM | None on server; handled by MCP client |
 | Containerization | Not currently implemented |
-| Testing | pytest + 98 tests (mocked ES client, no live cluster required) |
+| Testing | pytest + 517 tests (mocked ES client, no live cluster required) |
 | CI/CD | Not currently implemented |
 
 ## Project Structure
@@ -167,9 +167,9 @@ financial-mcp/
 │       ├── transactions.py
 │       └── analytics.py
 │
-├── tests/                 # 98 pytest tests (mocked, no live ES needed)
+├── tests/                 # 517 pytest tests (mocked, no live ES needed)
 ├── docs/
-│   └── USER_MANUAL.md
+└── USER_MANUAL.md
 ├── data/
 ├── backup/
 ├── pyproject.toml
@@ -590,8 +590,8 @@ This project is currently in **development**.
 
 Current state:
 
-- 98 automated tests (pytest, mocked ES — no live cluster required)
-- mypy-clean type checking
+- 517 automated tests (pytest, mocked ES — no live cluster required)
+- mypy-clean type checking (`uv run mypy financial_mcp/` → 0 errors)
 - Staging-index ingestion with atomic alias switch
 - Canonical 12-field schema with strict validation
 - No release tags
@@ -618,7 +618,7 @@ The current implementation supports:
 - Daily / weekly / monthly time-series aggregation
 - Category-level spending analysis
 - Financial summary generation
-- 98 automated tests (pytest)
+- 517 automated tests (pytest)
 
 ## Roadmap
 
@@ -628,9 +628,7 @@ Potential future improvements may include testing, observability, additional fin
 
 ## License
 
-No license has currently been selected for this project.
-
-Until a license is added, the repository should not be assumed to grant broad permissions to copy, modify, distribute, or commercially use the code.
+MIT — see [`LICENSE`](LICENSE).
 
 ## Repository
 
